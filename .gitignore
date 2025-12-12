@@ -30,3 +30,126 @@ go.work.sum
 # Editor/IDE
 # .idea/
 # .vscode/
+
+# 编译输出
+/bin/
+*.exe
+*.exe~
+*.dll
+*.so
+*.dylib
+openidcs-client
+*.test
+*.out
+coverage.html
+
+# Go工作区
+go.work
+
+# 依赖管理
+vendor/
+
+# IDE文件
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.DS_Store
+
+# 日志文件
+*.log
+logs/
+data/logs/
+
+# 数据库文件
+*.db
+*.sqlite
+*.sqlite3
+data/hostmanage.db
+
+# 配置文件（保留模板）
+config/local.yaml
+config/production.yaml
+config/development.yaml
+
+# 临时文件
+tmp/
+temp/
+*.tmp
+*.temp
+
+# 缓存文件
+.cache/
+*.cache
+
+# 测试文件
+test-data/
+coverage.out
+
+# 构建产物
+release/
+dist/
+build/
+
+# Docker相关
+.dockerignore
+
+# 文档生成
+docs/_build/
+*.aux
+*.log
+*.toc
+*.pdf
+
+# 密钥和证书
+*.pem
+*.key
+*.crt
+*.p12
+*.pfx
+secrets/
+.env
+.env.local
+.env.production
+
+# 监控数据
+monitoring/metrics/
+monitoring/reports/
+data/metrics/
+data/reports/
+
+# VNC录制文件
+*.flv
+*.webm
+recordings/
+
+# 系统文件
+Thumbs.db
+ehthumbs.db
+Desktop.ini
+
+# 压缩文件
+*.zip
+*.tar.gz
+*.rar
+
+# 备份文件
+*.bak
+*.backup
+
+# 本地开发
+.local/
+.localrc
+
+# 性能分析
+*.prof
+*.pprof
+
+# 内存转储
+*.hprof
+*.dump
+
+# 其他
+*.orig
+.merge_file_*

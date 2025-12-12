@@ -1,0 +1,95 @@
+version: '3.8'
+
+services:
+  openidcs-client:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: openidcs-client:latest
+    container_name: openidcs-client
+    restart: unless-stopped
+    ports:
+      - "1880:1880"
+    volumes:
+      - ./data:/app/data
+      - ./config:/app/config
+      - ./logs:/app/logs
+    environment:
+      - OPENIDCS_LOG_LEVEL=info
+      - OPENIDCS_SERVER_MODE=release
+    networks:
+      - openidcs-network
+    healthcheck:
+      test: ["CMD", "wget", "--no-verbose", "--tries=1", "--spider", "http://localhost:1880/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 40s
+
+  # 可选：添加数据库服务（如果使用MySQL或PostgreSQL）
+  # mysql:
+  #   image: mysql:8.0
+  #   container_name: openidcs-mysql
+  #   restart: unless-stopped
+  #   environment:
+  #     MYSQL_ROOT_PASSWORD: rootpassword
+  #     MYSQL_DATABASE: openidcs
+  #     MYSQL_USER: openidcs
+  #     MYSQL_PASSWORD: password
+  #   volumes:
+  #     - mysql_data:/var/lib/mysql
+  #   networks:
+  #     - openidcs-network
+  #   ports:
+  #     - "3306:3306"
+
+  # 可选：添加Redis缓存
+  # redis:
+  #   image: redis:7-alpine
+  #   container_name: openidcs-redis
+  #   restart: unless-stopped
+  #   volumes:
+  #     - redis_data:/data
+  #   networks:
+  #     - openidcs-network
+  #   ports:
+  #     - "6379:6379"
+
+  # 可选：添加Prometheus监控
+  # prometheus:
+  #   image: prom/prometheus:latest
+  #   container_name: openidcs-prometheus
+  #   restart: unless-stopped
+  #   volumes:
+  #     - ./monitoring/prometheus.yml:/etc/prometheus/prometheus.yml
+  #     - prometheus_data:/prometheus
+  #   networks:
+  #     - openidcs-network
+  #   ports:
+  #     - "9090:9090"
+
+  # 可选：添加Grafana仪表板
+  # grafana:
+  #   image: grafana/grafana:latest
+  #   container_name: openidcs-grafana
+  #   restart: unless-stopped
+  #   environment:
+  #     - GF_SECURITY_ADMIN_PASSWORD=admin
+  #   volumes:
+  #     - grafana_data:/var/lib/grafana
+  #     - ./monitoring/grafana/dashboards:/etc/grafana/provisioning/dashboards
+  #     - ./monitoring/grafana/datasources:/etc/grafana/provisioning/datasources
+  #   networks:
+  #     - openidcs-network
+  #   ports:
+  #     - "3000:3000"
+
+networks:
+  openidcs-network:
+    driver: bridge
+
+volumes:
+  mysql_data:
+  redis_data:
+  prometheus_data:
+  grafana_data:

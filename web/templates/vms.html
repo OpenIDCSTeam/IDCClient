@@ -1,0 +1,122 @@
+<!DOCTYPE html>
+<html lang="zh-CN" data-theme="light">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>{{.Title}}</title>
+    <link href="https://cdn.jsdelivr.net/npm/daisyui@4.12.10/dist/full.min.css" rel="stylesheet">
+    <script src="https://cdn.tailwindcss.com"></script>
+    <script src="https://code.iconify.design/3/3.1.0/iconify.min.js"></script>
+    <style>
+        .card-hover {
+            transition: all 0.25s ease;
+        }
+        .card-hover:hover {
+            transform: translateY(-2px);
+            box-shadow: 0 8px 16px -8px rgba(0, 0, 0, 0.1);
+        }
+        .smooth-transition {
+            transition: all 0.25s ease;
+        }
+    </style>
+</head>
+<body class="bg-gray-50 min-h-screen flex flex-col">
+    <!-- 导航栏 -->
+    <nav class="bg-white shadow-lg sticky top-0 z-50 flex-shrink-0">
+        <div class="container mx-auto px-4">
+            <div class="flex justify-between items-center py-4">
+                <div class="flex items-center space-x-4">
+                    <a href="/admin" class="flex items-center space-x-2 smooth-transition hover:scale-105">
+                        <span class="iconify text-blue-600" data-icon="mdi:server-network" data-width="32" data-height="32"></span>
+                        <h1 class="text-2xl font-bold text-blue-600">OpenIDCS</h1>
+                    </a>
+                    <div class="hidden md:flex space-x-1 ml-8">
+                        <a href="/admin" class="text-gray-700 hover:text-blue-600 hover:bg-blue-50 px-4 py-2 rounded-lg text-sm font-medium smooth-transition">
+                            <div class="flex items-center gap-2">
+                                <span class="iconify" data-icon="mdi:view-dashboard" data-width="20"></span>
+                                仪表盘
+                            </div>
+                        </a>
+                        <a href="/hosts" class="text-gray-700 hover:text-blue-600 hover:bg-blue-50 px-4 py-2 rounded-lg text-sm font-medium smooth-transition">
+                            <div class="flex items-center gap-2">
+                                <span class="iconify" data-icon="mdi:server" data-width="20"></span>
+                                主机管理
+                            </div>
+                        </a>
+                        <a href="/debug" class="text-gray-700 hover:text-blue-600 hover:bg-blue-50 px-4 py-2 rounded-lg text-sm font-medium smooth-transition">
+                            <div class="flex items-center gap-2">
+                                <span class="iconify" data-icon="mdi:file-document-multiple" data-width="20"></span>
+                                日志管理
+                            </div>
+                        </a>
+                        <a href="/settings" class="text-gray-700 hover:text-blue-600 hover:bg-blue-50 px-4 py-2 rounded-lg text-sm font-medium smooth-transition">
+                            <div class="flex items-center gap-2">
+                                <span class="iconify" data-icon="mdi:cog" data-width="20"></span>
+                                系统设置
+                            </div>
+                        </a>
+                    </div>
+                </div>
+                <div class="flex items-center space-x-4">
+                    <div class="flex items-center space-x-2 text-gray-700 bg-gray-50 px-3 py-2 rounded-lg smooth-transition hover:bg-gray-100">
+                        <span class="iconify text-gray-500" data-icon="mdi:account-circle" data-width="20"></span>
+                        <span class="text-sm font-medium">{{.Username}}</span>
+                    </div>
+                    <a href="/logout" class="bg-red-500 hover:bg-red-600 text-white px-4 py-2 rounded-lg text-sm font-medium btn-hover shadow-sm flex items-center gap-2">
+                        <span class="iconify" data-icon="mdi:logout" data-width="16"></span>
+                        退出
+                    </a>
+                </div>
+            </div>
+        </div>
+    </nav>
+
+    <!-- 主内容区 -->
+    <main class="container mx-auto px-4 py-8 flex-grow">
+        <!-- 页面标题 -->
+        <div class="mb-6">
+            <h1 class="text-3xl font-bold text-gray-800 flex items-center gap-3">
+                <span class="iconify text-blue-600" data-icon="mdi:cube-outline" data-width="36"></span>
+                虚拟机管理
+            </h1>
+            <p class="text-gray-600 mt-1">管理所有虚拟机实例</p>
+        </div>
+
+        <!-- 提示信息 -->
+        <div class="bg-white rounded-lg border border-gray-200 card-hover p-8">
+            <div class="text-center">
+                <span class="iconify text-gray-300" data-icon="mdi:cube-outline" data-width="64"></span>
+                <h2 class="text-xl font-semibold text-gray-700 mt-4 mb-2">虚拟机管理页面</h2>
+                <p class="text-gray-500 mb-6">此页面正在开发中，请先通过主机管理页面来管理虚拟机</p>
+                <a href="/hosts" class="inline-flex items-center gap-2 bg-blue-600 hover:bg-blue-700 text-white px-6 py-2 rounded-lg smooth-transition">
+                    <span class="iconify" data-icon="mdi:server" data-width="20"></span>
+                    前往主机管理
+                </a>
+            </div>
+        </div>
+    </main>
+
+    <!-- 页脚 -->
+    <footer class="bg-white border-t border-gray-200 flex-shrink-0">
+        <div class="container mx-auto px-4 py-4">
+            <div class="flex flex-col md:flex-row justify-between items-center text-sm text-gray-500">
+                <div class="flex items-center gap-2 mb-2 md:mb-0">
+                    <span class="iconify" data-icon="mdi:server-network" data-width="18"></span>
+                    <span>OpenIDCS 虚拟化管理平台</span>
+                </div>
+                <div class="flex items-center gap-4">
+                    <a href="https://github.com/OpenIDCSTeam" target="_blank" class="flex items-center gap-1 hover:text-blue-600 smooth-transition">
+                        <span class="iconify" data-icon="mdi:github" data-width="16"></span>
+                        OpenIDCS Team
+                    </a>
+                    <span>&copy; <span id="current-year"></span></span>
+                </div>
+            </div>
+        </div>
+    </footer>
+
+    <script>
+        document.getElementById('current-year').textContent = new Date().getFullYear();
+    </script>
+</body>
+</html>
