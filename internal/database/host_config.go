@@ -61,24 +61,52 @@ func (h *HostConfigDAO) GetAllGlobalConfigs() (map[string]string, error) {
 
 // SetHostConfig 保存主机配置
 func (h *HostConfigDAO) SetHostConfig(hsName string, config *models.HSConfig) error {
-	systemMapsJSON, _ := json.Marshal(config.SystemMaps)
-	publicAddrJSON, _ := json.Marshal(config.PublicAddr)
-	extendDataJSON, _ := json.Marshal(config.ExtendData)
-	serverDNSSJSON, _ := json.Marshal(config.ServerDNSS)
-	ipAddrMapsJSON, _ := json.Marshal(config.IPAddrMaps)
-	ipAddrDNSSJSON, _ := json.Marshal(config.IPAddrDNSS)
+	systemMapsJSON, err := json.Marshal(config.SystemMaps)
+	if err != nil {
+		return fmt.Errorf("序列化system_maps失败: %w", err)
+	}
+	
+	imagesMapsJSON, err := json.Marshal(config.ImagesMaps)
+	if err != nil {
+		return fmt.Errorf("序列化images_maps失败: %w", err)
+	}
+	
+	publicAddrJSON, err := json.Marshal(config.PublicAddr)
+	if err != nil {
+		return fmt.Errorf("序列化public_addr失败: %w", err)
+	}
+	
+	extendDataJSON, err := json.Marshal(config.ExtendData)
+	if err != nil {
+		return fmt.Errorf("序列化extend_data失败: %w", err)
+	}
+	
+	serverDNSSJSON, err := json.Marshal(config.ServerDNSS)
+	if err != nil {
+		return fmt.Errorf("序列化server_dnss失败: %w", err)
+	}
+	
+	ipAddrMapsJSON, err := json.Marshal(config.IPAddrMaps)
+	if err != nil {
+		return fmt.Errorf("序列化ipaddr_maps失败: %w", err)
+	}
+	
+	ipAddrDNSSJSON, err := json.Marshal(config.IPAddrDNSS)
+	if err != nil {
+		return fmt.Errorf("序列化ipaddr_dnss失败: %w", err)
+	}
 
 	query := `
 		INSERT OR REPLACE INTO hs_config (
 			hs_name, server_name, server_type, server_addr, server_user, server_pass,
 			filter_name, images_path, system_path, backup_path, extern_path,
 			launch_path, network_nat, network_pub, i_kuai_addr, i_kuai_user,
-			i_kuai_pass, ports_start, ports_close, remote_port, system_maps,
+			i_kuai_pass, ports_start, ports_close, remote_port, system_maps, images_maps,
 			public_addr, extend_data, server_dnss, limits_nums, ipaddr_maps, ipaddr_dnss, updated_at
-		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
+		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
 	`
 
-	_, err := h.db.Exec(query,
+	result, err := h.db.Exec(query,
 		hsName,
 		config.ServerName,
 		config.ServerType,
@@ -100,6 +128,7 @@ func (h *HostConfigDAO) SetHostConfig(hsName string, config *models.HSConfig) er
 		config.PortsClose,
 		config.RemotePort,
 		string(systemMapsJSON),
+		string(imagesMapsJSON),
 		string(publicAddrJSON),
 		string(extendDataJSON),
 		string(serverDNSSJSON),
@@ -108,7 +137,19 @@ func (h *HostConfigDAO) SetHostConfig(hsName string, config *models.HSConfig) er
 		string(ipAddrDNSSJSON),
 	)
 
-	return err
+	if err != nil {
+		return fmt.Errorf("保存主机配置失败: %w", err)
+	}
+
+	// 检查是否真的影响了行数
+	rowsAffected, err := result.RowsAffected()
+	if err != nil {
+		// 无法获取影响的行数，但不认为是致命错误
+	} else if rowsAffected == 0 {
+		return fmt.Errorf("保存主机配置失败: 没有行被影响")
+	}
+
+	return nil
 }
 
 // GetHostConfig 获取主机配置
@@ -117,13 +158,13 @@ func (h *HostConfigDAO) GetHostConfig(hsName string) (*models.HSConfig, error) {
 		SELECT server_name, server_type, server_addr, server_user, server_pass,
 			   filter_name, images_path, system_path, backup_path, extern_path,
 			   launch_path, network_nat, network_pub, i_kuai_addr, i_kuai_user,
-			   i_kuai_pass, ports_start, ports_close, remote_port, system_maps,
+			   i_kuai_pass, ports_start, ports_close, remote_port, system_maps, images_maps,
 			   public_addr, extend_data, server_dnss, limits_nums, ipaddr_maps, ipaddr_dnss
 		FROM hs_config WHERE hs_name = ?
 	`
 
 	var config models.HSConfig
-	var systemMapsJSON, publicAddrJSON, extendDataJSON, serverDNSSJSON, ipAddrMapsJSON, ipAddrDNSSJSON sql.NullString
+	var systemMapsJSON, imagesMapsJSON, publicAddrJSON, extendDataJSON, serverDNSSJSON, ipAddrMapsJSON, ipAddrDNSSJSON sql.NullString
 
 	err := h.db.QueryRow(query, hsName).Scan(
 		&config.ServerName,
@@ -146,6 +187,7 @@ func (h *HostConfigDAO) GetHostConfig(hsName string) (*models.HSConfig, error) {
 		&config.PortsClose,
 		&config.RemotePort,
 		&systemMapsJSON,
+		&imagesMapsJSON,
 		&publicAddrJSON,
 		&extendDataJSON,
 		&serverDNSSJSON,
@@ -164,6 +206,9 @@ func (h *HostConfigDAO) GetHostConfig(hsName string) (*models.HSConfig, error) {
 	// 解析JSON字段
 	if systemMapsJSON.Valid {
 		json.Unmarshal([]byte(systemMapsJSON.String), &config.SystemMaps)
+	}
+	if imagesMapsJSON.Valid {
+		json.Unmarshal([]byte(imagesMapsJSON.String), &config.ImagesMaps)
 	}
 	if publicAddrJSON.Valid {
 		json.Unmarshal([]byte(publicAddrJSON.String), &config.PublicAddr)
@@ -191,7 +236,7 @@ func (h *HostConfigDAO) GetAllHostConfigs() ([]*models.HSConfig, error) {
 		SELECT hs_name, server_name, server_type, server_addr, server_user, server_pass,
 			   filter_name, images_path, system_path, backup_path, extern_path,
 			   launch_path, network_nat, network_pub, i_kuai_addr, i_kuai_user,
-			   i_kuai_pass, ports_start, ports_close, remote_port, system_maps,
+			   i_kuai_pass, ports_start, ports_close, remote_port, system_maps, images_maps,
 			   public_addr, extend_data, server_dnss, limits_nums, ipaddr_maps, ipaddr_dnss
 		FROM hs_config
 	`
@@ -206,7 +251,7 @@ func (h *HostConfigDAO) GetAllHostConfigs() ([]*models.HSConfig, error) {
 	for rows.Next() {
 		var config models.HSConfig
 		var hsName string
-		var systemMapsJSON, publicAddrJSON, extendDataJSON, serverDNSSJSON, ipAddrMapsJSON, ipAddrDNSSJSON sql.NullString
+		var systemMapsJSON, imagesMapsJSON, publicAddrJSON, extendDataJSON, serverDNSSJSON, ipAddrMapsJSON, ipAddrDNSSJSON sql.NullString
 
 		err := rows.Scan(
 			&hsName,
@@ -230,6 +275,7 @@ func (h *HostConfigDAO) GetAllHostConfigs() ([]*models.HSConfig, error) {
 			&config.PortsClose,
 			&config.RemotePort,
 			&systemMapsJSON,
+			&imagesMapsJSON,
 			&publicAddrJSON,
 			&extendDataJSON,
 			&serverDNSSJSON,
@@ -245,6 +291,9 @@ func (h *HostConfigDAO) GetAllHostConfigs() ([]*models.HSConfig, error) {
 		// 解析JSON字段
 		if systemMapsJSON.Valid {
 			json.Unmarshal([]byte(systemMapsJSON.String), &config.SystemMaps)
+		}
+		if imagesMapsJSON.Valid {
+			json.Unmarshal([]byte(imagesMapsJSON.String), &config.ImagesMaps)
 		}
 		if publicAddrJSON.Valid {
 			json.Unmarshal([]byte(publicAddrJSON.String), &config.PublicAddr)
@@ -323,7 +372,7 @@ func (h *HostConfigDAO) GetHostConfigsByType(serverType string) ([]*models.HSCon
 		SELECT hs_name, server_name, server_type, server_addr, server_user, server_pass,
 			   filter_name, images_path, system_path, backup_path, extern_path,
 			   launch_path, network_nat, network_pub, i_kuai_addr, i_kuai_user,
-			   i_kuai_pass, ports_start, ports_close, remote_port, system_maps,
+			   i_kuai_pass, ports_start, ports_close, remote_port, system_maps, images_maps,
 			   public_addr, extend_data, server_dnss, limits_nums, ipaddr_maps, ipaddr_dnss
 		FROM hs_config WHERE server_type = ?
 	`
@@ -338,7 +387,7 @@ func (h *HostConfigDAO) GetHostConfigsByType(serverType string) ([]*models.HSCon
 	for rows.Next() {
 		var config models.HSConfig
 		var hsName string
-		var systemMapsJSON, publicAddrJSON, extendDataJSON, serverDNSSJSON, ipAddrMapsJSON, ipAddrDNSSJSON sql.NullString
+		var systemMapsJSON, imagesMapsJSON, publicAddrJSON, extendDataJSON, serverDNSSJSON, ipAddrMapsJSON, ipAddrDNSSJSON sql.NullString
 
 		err := rows.Scan(
 			&hsName,
@@ -362,6 +411,7 @@ func (h *HostConfigDAO) GetHostConfigsByType(serverType string) ([]*models.HSCon
 			&config.PortsClose,
 			&config.RemotePort,
 			&systemMapsJSON,
+			&imagesMapsJSON,
 			&publicAddrJSON,
 			&extendDataJSON,
 			&serverDNSSJSON,
@@ -377,6 +427,9 @@ func (h *HostConfigDAO) GetHostConfigsByType(serverType string) ([]*models.HSCon
 		// 解析JSON字段
 		if systemMapsJSON.Valid {
 			json.Unmarshal([]byte(systemMapsJSON.String), &config.SystemMaps)
+		}
+		if imagesMapsJSON.Valid {
+			json.Unmarshal([]byte(imagesMapsJSON.String), &config.ImagesMaps)
 		}
 		if publicAddrJSON.Valid {
 			json.Unmarshal([]byte(publicAddrJSON.String), &config.PublicAddr)

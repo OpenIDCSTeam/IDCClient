@@ -1,6 +1,7 @@
 package api
 
 import (
+	"fmt"
 	"strconv"
 	
 	"github.com/OpenIDCSTeam/OpenIDCS-Client-Go/internal/models"
@@ -64,13 +65,42 @@ func (r *RestManager) getVMsByHost(c *gin.Context) {
 		}
 	}
 	
-	vmInfos, err := r.vmManager.GetVMs(hsName)
-	if err != nil {
-		r.apiError(c, 500, "获取虚拟机失败: "+err.Error())
+	server := r.hostManager.GetHost(hsName)
+	if server == nil {
+		r.apiError(c, 404, "主机不存在")
 		return
 	}
-	
-	r.apiSuccess(c, vmInfos)
+
+	// 从数据库重新加载数据
+	err := server.LoadData()
+	if err != nil {
+		r.logger.Errorf("加载虚拟机数据失败: %v", err)
+	}
+
+	vmConfigs := server.GetAllVMs()
+	vmsData := make(map[string]interface{})
+
+	for vmUUID, vmConfig := range vmConfigs {
+		// 从 DataManage 获取状态（直接从数据库读取）
+		vmStatus := server.VMStatus(vmUUID)
+		var status []interface{}
+		
+		// 只取最新的一条状态，与Python版本保持一致
+		if len(vmStatus) > 0 {
+			latestStatus := vmStatus[len(vmStatus)-1]
+			if latestStatus != nil {
+				status = []interface{}{latestStatus}
+			}
+		}
+
+		vmsData[vmUUID] = map[string]interface{}{
+			"uuid":   vmUUID,
+			"config": vmConfig,
+			"status": status,
+		}
+	}
+
+	r.apiSuccess(c, vmsData)
 }
 
 // getVM 获取单个虚拟机
@@ -83,13 +113,42 @@ func (r *RestManager) getVM(c *gin.Context) {
 		return
 	}
 	
-	vmInfo, err := r.vmManager.GetVM(hsName, vmUUID)
-	if err != nil {
-		r.apiError(c, 404, "虚拟机不存在: "+err.Error())
+	server := r.hostManager.GetHost(hsName)
+	if server == nil {
+		r.apiError(c, 404, "主机不存在")
 		return
 	}
+
+	// 获取虚拟机配置
+	vmConfigs := server.GetAllVMs()
+	vmConfig, exists := vmConfigs[vmUUID]
+	if !exists {
+		r.apiError(c, 404, "虚拟机不存在")
+		return
+	}
+
+	// 获取虚拟机状态
+	vmStatus := server.VMStatus(vmUUID)
+	var statusResult []interface{}
 	
-	r.apiSuccess(c, vmInfo)
+	// 将HWStatus对象转换为字典，与Python版本保持一致
+	if len(vmStatus) > 0 {
+		for _, hwStatus := range vmStatus {
+			if hwStatus != nil {
+				statusResult = append(statusResult, hwStatus)
+			} else {
+				statusResult = append(statusResult, nil)
+			}
+		}
+	}
+
+	vmData := gin.H{
+		"uuid":   vmUUID,
+		"config": vmConfig,
+		"status": statusResult,
+	}
+	
+	r.apiSuccess(c, vmData)
 }
 
 // createVM 创建虚拟机
@@ -169,25 +228,63 @@ func (r *RestManager) vmPower(c *gin.Context) {
 		return
 	}
 	
-	var req struct {
-		Action models.VMPowers `json:"action" binding:"required"`
-	}
-	
-	if err := c.ShouldBindJSON(&req); err != nil {
-		r.apiError(c, 400, "操作类型不能为空")
+	server := r.hostManager.GetHost(hsName)
+	if server == nil {
+		r.apiError(c, 404, "主机不存在")
 		return
 	}
-	
-	err := r.vmManager.VMPower(hsName, vmUUID, req.Action)
-	if err != nil {
-		r.apiError(c, 500, "电源操作失败: "+err.Error())
-		return
-	}
-	
-	r.apiSuccess(c, nil)
-}
 
-// vmPassword 修改虚拟机密码
+	// 从JSON body获取action参数，与Python版本保持一致
+	var data map[string]interface{}
+	if err := c.ShouldBindJSON(&data); err != nil {
+		// 如果没有JSON body，使用默认值
+		data = make(map[string]interface{})
+	}
+	
+	actionStr, ok := data["action"].(string)
+	if !ok || actionStr == "" {
+		actionStr = "start" // 默认启动
+	}
+
+	// 映射操作到VMPowers枚举，与Python版本保持一致
+	var powerAction models.VMPowers
+	switch actionStr {
+	case "start":
+		powerAction = models.VMPowerStart
+	case "stop":
+		powerAction = models.VMPowerStop
+	case "hard_stop":
+		powerAction = models.VMPowerHardStop
+	case "reset":
+		powerAction = models.VMPowerReset
+	case "hard_reset":
+		powerAction = models.VMPowerHardReset
+	case "pause":
+		powerAction = models.VMPowerPause
+	case "resume":
+		powerAction = models.VMPowerResume
+	default:
+		r.apiError(c, 400, fmt.Sprintf("不支持的操作: %s", actionStr))
+		return
+	}
+
+	// 执行电源操作
+	result := server.VMPower(vmUUID, powerAction)
+	
+	if result != nil && result.Success {
+		message := result.Message
+		if message == "" {
+			message = fmt.Sprintf("电源操作 %s 成功", actionStr)
+		}
+		r.apiResponse(c, 200, message, nil)
+	} else {
+		message := "操作失败"
+		if result != nil && result.Message != "" {
+			message = result.Message
+		}
+		r.apiError(c, 400, message)
+	}
+}
 func (r *RestManager) vmPassword(c *gin.Context) {
 	hsName := c.Param("hs_name")
 	vmUUID := c.Param("vm_uuid")
@@ -298,27 +395,6 @@ func (r *RestManager) scanVMs(c *gin.Context) {
 	} else {
 		r.apiError(c, 500, result.Message)
 	}
-}
-
-// uploadVMStatus 虚拟机状态上报
-func (r *RestManager) uploadVMStatus(c *gin.Context) {
-	var req struct {
-		MacAddr    string                 `json:"mac_addr" binding:"required"`
-		StatusData map[string]interface{} `json:"status_data" binding:"required"`
-	}
-	
-	if err := c.ShouldBindJSON(&req); err != nil {
-		r.apiError(c, 400, "参数错误: "+err.Error())
-		return
-	}
-	
-	response, err := r.vmManager.UploadStatus(req.MacAddr, req.StatusData)
-	if err != nil {
-		r.apiError(c, 404, "未找到匹配的虚拟机: "+err.Error())
-		return
-	}
-	
-	r.apiSuccess(c, response)
 }
 
 // ============================================================================

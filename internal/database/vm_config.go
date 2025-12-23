@@ -4,6 +4,7 @@ import (
 	"database/sql"
 	"encoding/json"
 	"fmt"
+	"time"
 
 	"github.com/OpenIDCSTeam/OpenIDCS-Client-Go/internal/models"
 )
@@ -22,14 +23,19 @@ func NewVMConfigDAO(db *Database) *VMConfigDAO {
 func (v *VMConfigDAO) SetVMConfig(hsName string, vmConfigs map[string]*models.VMConfig) error {
 	tx, err := v.db.Begin()
 	if err != nil {
-		return err
+		return fmt.Errorf("开始事务失败: %w", err)
 	}
 	defer tx.Rollback()
 
 	// 删除旧的配置
-	_, err = tx.Exec("DELETE FROM vm_saving WHERE hs_name = ?", hsName)
+	result, err := tx.Exec("DELETE FROM vm_saving WHERE hs_name = ?", hsName)
 	if err != nil {
-		return err
+		return fmt.Errorf("删除旧虚拟机配置失败: %w", err)
+	}
+
+	// 检查删除操作
+	if rowsAffected, _ := result.RowsAffected(); rowsAffected > 0 {
+		v.db.logger.Debugf("删除了 %d 条旧的虚拟机配置", rowsAffected)
 	}
 
 	// 插入新配置
@@ -38,19 +44,30 @@ func (v *VMConfigDAO) SetVMConfig(hsName string, vmConfigs map[string]*models.VM
 		VALUES (?, ?, ?, CURRENT_TIMESTAMP)
 	`
 
+	count := 0
 	for vmUUID, vmConfig := range vmConfigs {
 		configJSON, err := json.Marshal(vmConfig)
 		if err != nil {
-			return fmt.Errorf("序列化虚拟机配置失败: %w", err)
+			return fmt.Errorf("序列化虚拟机配置失败 %s: %w", vmUUID, err)
 		}
 
-		_, err = tx.Exec(query, hsName, vmUUID, string(configJSON))
+		result, err := tx.Exec(query, hsName, vmUUID, string(configJSON))
 		if err != nil {
-			return fmt.Errorf("保存虚拟机配置失败: %w", err)
+			return fmt.Errorf("保存虚拟机配置失败 %s: %w", vmUUID, err)
 		}
+
+		if rowsAffected, _ := result.RowsAffected(); rowsAffected == 0 {
+			return fmt.Errorf("保存虚拟机配置失败 %s: 没有行被影响", vmUUID)
+		}
+		count++
 	}
 
-	return tx.Commit()
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("提交事务失败: %w", err)
+	}
+
+	v.db.logger.Debugf("成功保存了 %d 个虚拟机配置", count)
+	return nil
 }
 
 // GetVMConfigs 获取主机下的所有虚拟机配置
@@ -174,7 +191,7 @@ func (v *VMConfigDAO) GetAllVMConfigs() (map[string]map[string]*models.VMConfig,
 	return result, nil
 }
 
-// UpdateVMConfig 更新虚拟机配置
+// UpdateVMConfig 更新虚拟机配置（只更新配置，不更新时间戳）
 func (v *VMConfigDAO) UpdateVMConfig(hsName, vmUUID string, vmConfig *models.VMConfig) error {
 	exists, err := v.VMConfigExists(hsName, vmUUID)
 	if err != nil {
@@ -189,9 +206,10 @@ func (v *VMConfigDAO) UpdateVMConfig(hsName, vmUUID string, vmConfig *models.VMC
 		return fmt.Errorf("序列化虚拟机配置失败: %w", err)
 	}
 
+	// 只更新配置信息，不更新时间戳（根据要求：vm_saving表更新时不得覆写created_at和updated_at）
 	query := `
 		UPDATE vm_saving 
-		SET vm_config = ?, updated_at = CURRENT_TIMESTAMP 
+		SET vm_config = ? 
 		WHERE hs_name = ? AND vm_uuid = ?
 	`
 
@@ -237,4 +255,50 @@ func (v *VMConfigDAO) CopyVMConfigs(srcHSName, dstHSName string) error {
 	}
 
 	return v.SetVMConfig(dstHSName, vmConfigs)
+}
+
+// UpdateVMStatusTimestamp 更新虚拟机状态时间戳（仅在状态上报时调用）
+func (v *VMConfigDAO) UpdateVMStatusTimestamp(hsName, vmUUID string) error {
+	exists, err := v.VMConfigExists(hsName, vmUUID)
+	if err != nil {
+		return err
+	}
+	if !exists {
+		return fmt.Errorf("虚拟机配置不存在: %s/%s", hsName, vmUUID)
+	}
+
+	// 只更新updated_at时间戳，不修改配置内容
+	query := `
+		UPDATE vm_saving 
+		SET updated_at = CURRENT_TIMESTAMP 
+		WHERE hs_name = ? AND vm_uuid = ?
+	`
+
+	_, err = v.db.Exec(query, hsName, vmUUID)
+	return err
+}
+
+// GetVMConfigWithTimestamp 获取带时间戳的虚拟机配置
+func (v *VMConfigDAO) GetVMConfigWithTimestamp(hsName, vmUUID string) (*models.VMConfig, *time.Time, *time.Time, error) {
+	query := `
+		SELECT vm_config, created_at, updated_at 
+		FROM vm_saving 
+		WHERE hs_name = ? AND vm_uuid = ?
+	`
+	var configJSON string
+	var createdAt, updatedAt time.Time
+	err := v.db.QueryRow(query, hsName, vmUUID).Scan(&configJSON, &createdAt, &updatedAt)
+	if err == sql.ErrNoRows {
+		return nil, nil, nil, nil
+	}
+	if err != nil {
+		return nil, nil, nil, err
+	}
+
+	var vmConfig models.VMConfig
+	if err := json.Unmarshal([]byte(configJSON), &vmConfig); err != nil {
+		return nil, nil, nil, fmt.Errorf("反序列化虚拟机配置失败: %w", err)
+	}
+
+	return &vmConfig, &createdAt, &updatedAt, nil
 }

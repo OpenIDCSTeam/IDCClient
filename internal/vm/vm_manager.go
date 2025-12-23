@@ -72,10 +72,22 @@ func (v *VMManager) GetVMs(hsName string) (map[string]*models.VMInfo, error) {
 			vmInfo.Networks = append(vmInfo.Networks, nicConfig)
 		}
 
-		// 获取状态
+		// 获取状态，包含离线判断逻辑
 		if len(vmStatus) > 0 {
 			latestStatus := vmStatus[len(vmStatus)-1]
 			vmInfo.Status = latestStatus.Status
+			
+			// 获取虚拟机的updated_at时间戳进行离线判断
+			vmConfigDAO := v.hostManager.GetVMConfigDAO()
+			if vmConfigDAO != nil {
+				_, _, updatedAt, err := vmConfigDAO.GetVMConfigWithTimestamp(hsName, vmUUID)
+				if err == nil && updatedAt != nil {
+					// 如果updated_at比现在早超过10分钟，则视为离线
+					if time.Since(*updatedAt) > 10*time.Minute {
+						vmInfo.Status = "offline"
+					}
+				}
+			}
 		} else {
 			vmInfo.Status = "unknown"
 		}
@@ -127,12 +139,24 @@ func (v *VMManager) GetVM(hsName, vmUUID string) (*models.VMInfo, error) {
 		vmInfo.Networks = append(vmInfo.Networks, nicConfig)
 	}
 
-	// 获取状态
+	// 获取状态，包含离线判断逻辑
 	if len(vmStatus) > 0 {
 		latestStatus := vmStatus[len(vmStatus)-1]
 		vmInfo.Status = latestStatus.Status
 		now := time.Now()
 		vmInfo.LastSeen = &now
+		
+		// 获取虚拟机的updated_at时间戳进行离线判断
+		vmConfigDAO := v.hostManager.GetVMConfigDAO()
+		if vmConfigDAO != nil {
+			_, _, updatedAt, err := vmConfigDAO.GetVMConfigWithTimestamp(hsName, vmUUID)
+			if err == nil && updatedAt != nil {
+				// 如果updated_at比现在早超过10分钟，则视为离线
+				if time.Since(*updatedAt) > 10*time.Minute {
+					vmInfo.Status = "offline"
+				}
+			}
+		}
 	} else {
 		vmInfo.Status = "unknown"
 	}
@@ -338,6 +362,26 @@ func (v *VMManager) VMStatus(hsName, vmUUID string) ([]*models.HWStatus, error) 
 	}
 
 	statuses := server.VMStatus(vmUUID)
+	
+	// 检查虚拟机是否离线（如果updated_at比现在早超过10分钟）
+	vmConfigDAO := v.hostManager.GetVMConfigDAO()
+	if vmConfigDAO != nil {
+		_, _, updatedAt, err := vmConfigDAO.GetVMConfigWithTimestamp(hsName, vmUUID)
+		if err == nil && updatedAt != nil {
+			// 如果updated_at比现在早超过10分钟，则视为离线
+			if time.Since(*updatedAt) > 10*time.Minute {
+				// 如果离线且状态列表不为空，更新最新状态为offline
+				if len(statuses) > 0 {
+					latestStatus := statuses[len(statuses)-1]
+					if latestStatus != nil {
+						latestStatus.Status = "offline"
+						latestStatus.AcStatus = "STOPPED" // 同时更新ac_status字段
+					}
+				}
+			}
+		}
+	}
+	
 	return statuses, nil
 }
 
@@ -363,7 +407,9 @@ func (v *VMManager) ScanVMs(hsName, prefix string) (*models.ZMessage, error) {
 		}
 
 		// 保存系统配置
-		v.hostManager.SaveAll()
+		if err := v.hostManager.SaveAll(); err != nil {
+			v.logger.Errorf("保存系统配置失败: %v", err)
+		}
 	}
 
 	return result, nil
@@ -423,6 +469,18 @@ func (v *VMManager) UploadStatus(macAddr string, statusData map[string]interface
 
 					hwStatus.Timestamp = time.Now()
 					hwStatus.Status = "running"
+					hwStatus.AcStatus = "STARTED" // 设置ac_status字段，与Python版本保持一致
+
+					// 更新虚拟机的updated_at时间戳（仅在有数据上报时修改）
+					vmConfigDAO := v.hostManager.GetVMConfigDAO()
+					if vmConfigDAO != nil {
+						err := vmConfigDAO.UpdateVMStatusTimestamp(hsName, vmUUID)
+						if err != nil {
+							v.logger.Errorf("更新虚拟机状态时间戳失败: %v", err)
+						} else {
+							v.logger.Infof("更新虚拟机 %s 状态时间戳成功", vmUUID)
+						}
+					}
 
 					// 保存状态到数据库
 					// 这里需要通过数据库DAO来保存，暂时跳过

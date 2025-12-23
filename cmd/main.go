@@ -34,6 +34,8 @@ type Application struct {
 	restManager *api.RestManager
 	router      *api.Router
 	server      *http.Server
+	cronTicker  *time.Ticker
+	cronDone    chan bool
 }
 
 // Run 运行应用程序
@@ -71,6 +73,9 @@ func (app *Application) Run() error {
 		app.logger.Warnf("加载配置失败: %v", err)
 	}
 
+	// 启动定时任务调度器（与Python版本一致，每60秒执行一次）
+	app.startCronScheduler()
+
 	app.logger.Info("应用程序启动完成")
 
 	// 启动Web服务器
@@ -86,6 +91,58 @@ func (app *Application) initLogger() *logrus.Logger {
 	logger.SetLevel(logrus.InfoLevel)
 	logger.SetOutput(os.Stdout)
 	return logger
+}
+
+// startCronScheduler 启动定时任务调度器 - 与Python版本完全一致
+func (app *Application) startCronScheduler() {
+	app.logger.Info("[Cron] 启动定时任务调度器...")
+	
+	// 创建定时器，每60秒执行一次（与Python版本一致）
+	app.cronTicker = time.NewTicker(60 * time.Second)
+	app.cronDone = make(chan bool)
+	
+	// 立即执行一次（与Python版本的initial_run一致）
+	go func() {
+		app.executeCronTask()
+		app.logger.Info("[Cron] 初始执行完成")
+		
+		// 开始定时循环
+		for {
+			select {
+			case <-app.cronTicker.C:
+				app.executeCronTask()
+			case <-app.cronDone:
+				return
+			}
+		}
+	}()
+	
+	app.logger.Info("[Cron] 定时任务已启动（后台运行），每60秒执行一次")
+}
+
+// executeCronTask 执行定时任务 - 与Python版本完全一致
+func (app *Application) executeCronTask() {
+	defer func() {
+		if r := recover(); r != nil {
+			app.logger.Errorf("[Cron] 执行定时任务出错: %v", r)
+		}
+	}()
+	
+	app.logger.Debug("[Cron] 执行定时任务")
+	
+	// 调用HostManager的ExecuteCron方法（对应Python版本的hs_manage.exe_cron()）
+	app.hostManager.ExecuteCron()
+	
+	app.logger.Debug("[Cron] 执行定时任务完成")
+}
+
+// stopCronScheduler 停止定时任务调度器
+func (app *Application) stopCronScheduler() {
+	if app.cronTicker != nil {
+		app.cronTicker.Stop()
+		close(app.cronDone)
+		app.logger.Info("[Cron] 定时任务调度器已停止")
+	}
 }
 
 // startWebServer 启动Web服务器
@@ -120,6 +177,16 @@ func (app *Application) waitForShutdown() {
 	signal.Notify(quit, syscall.SIGINT, syscall.SIGTERM)
 	<-quit
 	
+	app.logger.Info("正在关闭应用程序...")
+	
+	// 停止定时任务调度器
+	app.stopCronScheduler()
+	
+	// 保存所有数据（与Python版本的all_save()一致）
+	if err := app.hostManager.SaveAll(); err != nil {
+		app.logger.Error("保存数据失败: " + err.Error())
+	}
+	
 	app.logger.Info("正在关闭Web服务器...")
 	
 	// 创建一个5秒的上下文用于关闭
@@ -131,5 +198,5 @@ func (app *Application) waitForShutdown() {
 		app.logger.Errorf("Web服务器关闭失败: %v", err)
 	}
 	
-	app.logger.Info("Web服务器已关闭")
+	app.logger.Info("应用程序已关闭")
 }

@@ -11,15 +11,18 @@ import (
 	"github.com/sirupsen/logrus"
 )
 
-// HostManager 主机管理器
+// HostManager 主机管理器 - 与Python版本的HostManage完全一致
 type HostManager struct {
 	engines       map[string]BaseServer
 	logger        []*models.ZMessage
 	bearer        string
 	db            *database.Database
 	hostConfigDAO *database.HostConfigDAO
+	vmConfigDAO   *database.VMConfigDAO
 	statusDAO     *database.StatusDAO
 	logDAO        *database.LogDAO
+	proxys        interface{} // 全局HTTP代理管理器，对应Python版本的HttpManage
+	webAll        []*models.WebProxy // 全局代理配置列表，对应Python版本的web_all
 	mutex         sync.RWMutex
 	loggerField   *logrus.Logger
 }
@@ -31,8 +34,11 @@ func NewHostManager(db *database.Database, logger *logrus.Logger) *HostManager {
 		logger:        make([]*models.ZMessage, 0),
 		db:            db,
 		hostConfigDAO: database.NewHostConfigDAO(db),
+		vmConfigDAO:   database.NewVMConfigDAO(db),
 		statusDAO:     database.NewStatusDAO(db),
 		logDAO:        database.NewLogDAO(db),
+		proxys:        nil, // 初始化为nil，在LoadAll中创建
+		webAll:        make([]*models.WebProxy, 0), // 初始化全局代理配置列表
 		mutex:         sync.RWMutex{},
 		loggerField:   logger,
 	}
@@ -100,6 +106,11 @@ func (h *HostManager) GetBearer() string {
 	return h.bearer
 }
 
+// GetVMConfigDAO 获取虚拟机配置DAO
+func (h *HostManager) GetVMConfigDAO() *database.VMConfigDAO {
+	return h.vmConfigDAO
+}
+
 // GetHost 获取主机
 func (h *HostManager) GetHost(hsName string) BaseServer {
 	h.mutex.RLock()
@@ -144,15 +155,18 @@ func (h *HostManager) AddHost(hsName, hsType string, hsConfig *models.HSConfig) 
 
 	// 添加到管理器
 	h.engines[hsName] = server
+	h.loggerField.Infof("主机 %s 已添加到内存缓存，当前主机数量: %d", hsName, len(h.engines))
 
 	// 保存配置到数据库
 	err = h.hostConfigDAO.SetHostConfig(hsName, hsConfig)
 	if err != nil {
 		// 回滚
 		delete(h.engines, hsName)
+		h.loggerField.Errorf("保存主机配置到数据库失败: %v", err)
 		return models.NewZMessage(false, "AddHost", fmt.Sprintf("保存配置失败: %v", err))
 	}
 
+	h.loggerField.Infof("主机 %s 配置已保存到数据库", hsName)
 	return models.NewZMessage(true, "AddHost", "主机添加成功")
 }
 
@@ -194,6 +208,11 @@ func (h *HostManager) UpdateHost(hsName string, hsConfig *models.HSConfig) *mode
 		return models.NewZMessage(false, "UpdateHost", "主机不存在")
 	}
 
+	// 记录更新前的配置
+	oldConfig := server.GetConfig()
+	h.loggerField.Infof("更新主机 %s: 旧配置 network_pub=%s, 新配置 network_pub=%s", 
+		hsName, oldConfig.NetworkPub, hsConfig.NetworkPub)
+
 	// 保存原有虚拟机配置
 	oldVMSaving := server.GetAllVMs()
 
@@ -223,12 +242,17 @@ func (h *HostManager) UpdateHost(hsName string, hsConfig *models.HSConfig) *mode
 
 	// 更新管理器
 	h.engines[hsName] = newServer
+	h.loggerField.Infof("主机 %s 内存缓存已更新，新配置 network_pub=%s", hsName, newServer.GetConfig().NetworkPub)
 
 	// 保存配置到数据库
 	err = h.hostConfigDAO.SetHostConfig(hsName, hsConfig)
 	if err != nil {
+		// 回滚：恢复旧的主机实例
+		h.engines[hsName] = server
+		h.loggerField.Errorf("保存主机配置到数据库失败: %v", err)
 		return models.NewZMessage(false, "UpdateHost", fmt.Sprintf("保存配置失败: %v", err))
 	}
+	h.loggerField.Infof("主机 %s 配置已保存到数据库", hsName)
 
 	return models.NewZMessage(true, "UpdateHost", "主机更新成功")
 }
@@ -272,6 +296,33 @@ func (h *HostManager) LoadAll() error {
 	// 加载全局日志
 	h.loadGlobalLogs()
 
+	// 启动Http实例（与Python版本一致）
+	// h.proxys = HttpManage()
+	// h.proxys.start_web()
+
+	// 加载全局代理配置（与Python版本一致）
+	h.webAll = []*models.WebProxy{}
+	// webProxyList := h.hostConfigDAO.GetWebProxy()
+	// for _, proxyData := range webProxyList {
+	//     webProxy := &models.WebProxy{
+	//         LanPort:  proxyData["lan_port"].(int),
+	//         LanAddr:  proxyData["lan_addr"].(string),
+	//         WebAddr:  proxyData["web_addr"].(string),
+	//         WebTips:  proxyData["web_tips"].(string),
+	//         IsHTTPS:  proxyData["is_https"].(bool),
+	//     }
+	//     h.webAll = append(h.webAll, webProxy)
+	//     
+	//     // 添加到HttpManage
+	//     if h.proxys != nil {
+	//         h.proxys.proxy_add(
+	//             (webProxy.LanPort, webProxy.LanAddr),
+	//             webProxy.WebAddr,
+	//             webProxy.IsHTTPS
+	//         )
+	//     }
+	// }
+
 	// 加载所有主机配置
 	hostConfigs, err := h.hostConfigDAO.GetAllHostConfigs()
 	if err != nil {
@@ -305,11 +356,12 @@ func (h *HostManager) LoadAll() error {
 }
 
 // SaveAll 保存所有配置
-func (h *HostManager) SaveAll() bool {
+func (h *HostManager) SaveAll() error {
 	h.mutex.RLock()
 	defer h.mutex.RUnlock()
 
-	success := true
+	errorCount := 0
+	var lastError error
 
 	// 保存全局日志
 	if len(h.logger) > 0 {
@@ -317,7 +369,8 @@ func (h *HostManager) SaveAll() bool {
 			err := h.logDAO.AddLog("", log) // 全局日志
 			if err != nil {
 				h.loggerField.Errorf("保存全局日志失败: %v", err)
-				success = false
+				errorCount++
+				lastError = err
 			}
 		}
 	}
@@ -327,11 +380,23 @@ func (h *HostManager) SaveAll() bool {
 		err := server.SaveData()
 		if err != nil {
 			h.loggerField.Errorf("保存主机配置失败 %s: %v", hsName, err)
-			success = false
+			errorCount++
+			lastError = fmt.Errorf("主机 %s 保存失败: %w", hsName, err)
 		}
 	}
 
-	return success
+	// 关闭web服务器（与Python版本一致）
+	// if h.proxys != nil {
+	//     h.proxys.close_web()
+	// }
+
+	if errorCount > 0 {
+		h.loggerField.Errorf("保存数据失败，共 %d 个错误", errorCount)
+		return lastError
+	} else {
+		h.loggerField.Debug("所有数据保存成功")
+		return nil
+	}
 }
 
 // GetAllHosts 获取所有主机
@@ -537,4 +602,149 @@ func (h *HostManager) GetSystemStats() *models.SystemStats {
 	}
 
 	return stats
+}
+
+// ============================================================================
+// 全局代理管理方法 - 与Python版本的HostManage.py保持一致
+// ============================================================================
+
+// AddProxy 添加全局代理配置 - 与Python版本一致
+func (h *HostManager) AddProxy(proxyData map[string]interface{}) *models.ZMessage {
+	defer func() {
+		if r := recover(); r != nil {
+			h.loggerField.Errorf("添加全局代理失败: %v", r)
+		}
+	}()
+
+	// 创建WebProxy对象
+	webProxy := &models.WebProxy{
+		LanPort:  int(proxyData["lan_port"].(float64)),
+		LanAddr:  proxyData["lan_addr"].(string),
+		WebAddr:  proxyData["web_addr"].(string),
+		WebTips:  proxyData["web_tips"].(string),
+		IsHTTPS:  proxyData["is_https"].(bool),
+	}
+
+	// 检查代理是否已存在
+	for _, proxy := range h.webAll {
+		if proxy.WebAddr == webProxy.WebAddr {
+			return models.NewZMessage(false, "AddProxy", "代理域名 "+webProxy.WebAddr+" 已存在")
+		}
+	}
+
+	// 调用HttpManage添加代理
+	if h.proxys != nil {
+		// TODO: 实现proxy_add方法
+		// result := h.proxys.proxy_add(
+		//     (webProxy.LanPort, webProxy.LanAddr),
+		//     webProxy.WebAddr,
+		//     webProxy.IsHTTPS
+		// )
+		// if !result {
+		//     return models.NewZMessage(false, "AddProxy", "添加代理到HttpManage失败")
+		// }
+	} else {
+		return models.NewZMessage(false, "AddProxy", "HttpManage未初始化")
+	}
+
+	// 添加到webAll列表
+	h.mutex.Lock()
+	h.webAll = append(h.webAll, webProxy)
+	h.mutex.Unlock()
+
+	// 保存到数据库
+	// success := h.hostConfigDAO.AddWebProxy(proxyData)
+	// if !success {
+	//     // 如果保存失败，回滚操作
+	//     h.mutex.Lock()
+	//     h.webAll = h.webAll[:len(h.webAll)-1]
+	//     h.mutex.Unlock()
+	//     if h.proxys != nil {
+	//         // h.proxys.proxy_del(webProxy.WebAddr)
+	//     }
+	//     return models.NewZMessage(false, "AddProxy", "保存代理配置到数据库失败")
+	// }
+
+	return models.NewZMessage(true, "AddProxy", "代理 "+webProxy.WebAddr+" 添加成功")
+}
+
+// DeleteProxy 删除全局代理配置 - 与Python版本一致
+func (h *HostManager) DeleteProxy(webAddr string) *models.ZMessage {
+	defer func() {
+		if r := recover(); r != nil {
+			h.loggerField.Errorf("删除全局代理失败: %v", r)
+		}
+	}()
+
+	// 查找代理
+	var webProxy *models.WebProxy = nil
+	h.mutex.Lock()
+	for i, proxy := range h.webAll {
+		if proxy.WebAddr == webAddr {
+			webProxy = proxy
+			// 从webAll列表移除
+			h.webAll = append(h.webAll[:i], h.webAll[i+1:]...)
+			break
+		}
+	}
+	h.mutex.Unlock()
+
+	if webProxy == nil {
+		return models.NewZMessage(false, "DeleteProxy", "代理域名 "+webAddr+" 不存在")
+	}
+
+	// 调用HttpManage删除代理
+	if h.proxys != nil {
+		// TODO: 实现proxy_del方法
+		// result := h.proxys.proxy_del(webAddr)
+		// if !result {
+		//     return models.NewZMessage(false, "DeleteProxy", "从HttpManage删除代理失败")
+		// }
+	} else {
+		return models.NewZMessage(false, "DeleteProxy", "HttpManage未初始化")
+	}
+
+	// 从数据库删除
+	// success := h.hostConfigDAO.DeleteWebProxy(webAddr)
+	// if !success {
+	//     // 如果删除失败，回滚操作
+	//     h.mutex.Lock()
+	//     h.webAll = append(h.webAll, webProxy)
+	//     h.mutex.Unlock()
+	//     if h.proxys != nil {
+	//         // h.proxys.proxy_add(
+	//         //     (webProxy.LanPort, webProxy.LanAddr),
+	//         //     webProxy.WebAddr,
+	//         //     webProxy.IsHTTPS
+	//         // )
+	//     }
+	//     return models.NewZMessage(false, "DeleteProxy", "从数据库删除代理配置失败")
+	// }
+
+	return models.NewZMessage(true, "DeleteProxy", "代理 "+webAddr+" 删除成功")
+}
+
+// GetAllProxies 获取所有全局代理配置 - 与Python版本一致
+func (h *HostManager) GetAllProxies() []*models.WebProxy {
+	h.mutex.RLock()
+	defer h.mutex.RUnlock()
+	
+	// 返回副本
+	result := make([]*models.WebProxy, len(h.webAll))
+	copy(result, h.webAll)
+	return result
+}
+
+// SetProxys 设置全局代理管理器 - 与Python版本一致
+func (h *HostManager) SetProxys(proxys interface{}) {
+	h.mutex.Lock()
+	defer h.mutex.Unlock()
+	h.proxys = proxys
+}
+
+// GetProxys 获取全局代理管理器 - 与Python版本一致
+func (h *HostManager) GetProxys() interface{} {
+	h.mutex.RLock()
+	defer h.mutex.RUnlock()
+	return h.proxys
 }

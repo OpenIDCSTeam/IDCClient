@@ -27,6 +27,7 @@ type HSConfig struct {
 	PortsClose   int               `json:"ports_close" db:"ports_close"`
 	RemotePort   int               `json:"remote_port" db:"remote_port"`
 	SystemMaps   map[string]string `json:"system_maps" db:"system_maps"`
+	ImagesMaps   map[string]string `json:"images_maps" db:"images_maps"`   // ISO镜像映射: 显示名称->文件名(xxx.iso)
 	PublicAddr   []string          `json:"public_addr" db:"public_addr"`
 	ExtendData   map[string]string `json:"extend_data" db:"extend_data"`
 	ServerDNSS   []string          `json:"server_dnss" db:"server_dnss"`
@@ -110,6 +111,7 @@ type HWStatus struct {
 	FluUsage    float64 `json:"flu_usage"`
 	Timestamp   time.Time `json:"timestamp"`
 	Status      string  `json:"status"`
+	AcStatus    string  `json:"ac_status"` // 添加ac_status字段，与Python版本保持一致
 	Uptime      int64   `json:"uptime"`
 	Processes   int     `json:"processes"`
 	LoadAvg     float64 `json:"load_avg"`

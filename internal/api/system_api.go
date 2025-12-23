@@ -33,16 +33,16 @@ func (r *RestManager) RegisterSystemAPI(router *gin.RouterGroup) {
 	}
 }
 
-// getCurrentToken 获取当前Token
+// getCurrentToken 获取当前Token - 与Python版本一致
 func (r *RestManager) getCurrentToken(c *gin.Context) {
 	token := r.hostManager.GetBearer()
-	r.apiSuccess(c, gin.H{"token": token})
+	r.apiResponse(c, 200, "获取Token成功", gin.H{"token": token})
 }
 
-// setToken 设置Token
+// setToken 设置Token - 与Python版本一致
 func (r *RestManager) setToken(c *gin.Context) {
 	var req struct {
-		Token string `json:"token" binding:"required"`
+		Token string `json:"token"`
 	}
 
 	if err := c.ShouldBindJSON(&req); err != nil {
@@ -50,48 +50,54 @@ func (r *RestManager) setToken(c *gin.Context) {
 		return
 	}
 
+	if req.Token == "" {
+		r.apiError(c, 400, "Token不能为空")
+		return
+	}
+
 	newToken := r.hostManager.SetPassword(req.Token)
-	r.apiSuccess(c, gin.H{"token": newToken})
+	r.apiResponse(c, 200, "Token设置成功", gin.H{"token": newToken})
 }
 
-// resetToken 重置Token
+// resetToken 重置Token - 与Python版本一致
 func (r *RestManager) resetToken(c *gin.Context) {
 	newToken := r.hostManager.SetPassword("") // 空字符串会生成新Token
-	r.apiSuccess(c, gin.H{"token": newToken})
+	r.apiResponse(c, 200, "Token重置成功", gin.H{"token": newToken})
 }
 
-// getEngineTypes 获取引擎类型
+// getEngineTypes 获取引擎类型 - 与Python版本一致
 func (r *RestManager) getEngineTypes(c *gin.Context) {
 	engineConfigs := r.hostManager.GetEngineConfigs()
 	r.apiSuccess(c, engineConfigs)
 }
 
-// saveSystem 保存系统配置
+// saveSystem 保存系统配置 - 与Python版本一致
 func (r *RestManager) saveSystem(c *gin.Context) {
-	if r.hostManager.SaveAll() {
-		r.apiSuccess(c, nil)
-	} else {
-		r.apiError(c, 500, "保存失败")
+	err := r.hostManager.SaveAll()
+	if err != nil {
+		r.apiError(c, 500, "保存失败: "+err.Error())
+		return
 	}
+	r.apiResponse(c, 200, "配置已保存", nil)
 }
 
-// loadSystem 加载系统配置
+// loadSystem 加载系统配置 - 与Python版本一致
 func (r *RestManager) loadSystem(c *gin.Context) {
 	err := r.hostManager.LoadAll()
 	if err != nil {
 		r.apiError(c, 500, "加载失败: "+err.Error())
 		return
 	}
-	r.apiSuccess(c, nil)
+	r.apiResponse(c, 200, "配置已加载", nil)
 }
 
-// getSystemStats 获取系统统计信息
+// getSystemStats 获取系统统计信息 - 与Python版本一致
 func (r *RestManager) getSystemStats(c *gin.Context) {
 	stats := r.hostManager.GetSystemStats()
 	r.apiSuccess(c, stats)
 }
 
-// getStats 获取统计信息（别名）
+// getStats 获取统计信息（别名）- 与Python版本一致
 func (r *RestManager) getStats(c *gin.Context) {
 	hostCount := r.hostManager.GetHostCount()
 	totalVMs := 0
@@ -115,7 +121,7 @@ func (r *RestManager) getStats(c *gin.Context) {
 	r.apiSuccess(c, stats)
 }
 
-// getLogs 获取日志
+// getLogs 获取日志 - 与Python版本一致
 func (r *RestManager) getLogs(c *gin.Context) {
 	hsName := r.getQueryParam(c, "hs_name", "")
 	limit := r.getQueryInt(c, "limit", 100)
@@ -134,10 +140,28 @@ func (r *RestManager) getLogs(c *gin.Context) {
 		return
 	}
 
-	r.apiSuccess(c, logs)
+	// 处理日志数据，与Python版本格式一致
+	processedLogs := make([]gin.H, 0)
+	for _, log := range logs {
+		processedLog := gin.H{
+			"id":         "",
+			"actions":    log.Action,
+			"message":    log.Message,
+			"success":    log.Success,
+			"results":    log.Results,
+			"execute":    log.Execute,
+			"level":      func() string { if log.Success { return "INFO" } else { return "ERROR" } }(),
+			"timestamp":  log.Time,
+			"host":       hsName,
+			"created_at": log.Time,
+		}
+		processedLogs = append(processedLogs, processedLog)
+	}
+
+	r.apiResponse(c, 200, "获取日志成功", processedLogs)
 }
 
-// getTasks 获取任务
+// getTasks 获取任务 - 与Python版本一致
 func (r *RestManager) getTasks(c *gin.Context) {
 	hsName := r.getQueryParam(c, "hs_name", "")
 	_ = r.getQueryInt(c, "limit", 100) // limit参数暂时未使用，但保留以备将来扩展
@@ -151,5 +175,5 @@ func (r *RestManager) getTasks(c *gin.Context) {
 	// TODO: 使用limit参数来限制返回的任务数量
 	// 暂时返回空列表
 	tasks := []interface{}{}
-	r.apiSuccess(c, tasks)
+	r.apiResponse(c, 200, "获取任务成功", tasks)
 }

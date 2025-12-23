@@ -107,6 +107,7 @@ func (d *Database) initTables() error {
 		ports_close INTEGER DEFAULT 5999,
 		remote_port INTEGER DEFAULT 0,
 		system_maps TEXT DEFAULT '{}',
+		images_maps TEXT DEFAULT '{}',
 		public_addr TEXT DEFAULT '[]',
 		extend_data TEXT DEFAULT '{}',
 		server_dnss TEXT DEFAULT '[]',
