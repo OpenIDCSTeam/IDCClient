@@ -1,0 +1,137 @@
+{
+  "summary": {
+    "python_total": 126,
+    "go_total": 131,
+    "python_paths": 116,
+    "go_paths": 121
+  },
+  "missing_in_go": [
+    {
+      "path": "/:path:path",
+      "methods": [
+        "GET"
+      ],
+      "status": "path_missing"
+    },
+    {
+      "path": "/client/natdel/:hs_name/:vm_uuid/:int:rule_index",
+      "methods": [
+        "DELETE"
+      ],
+      "status": "path_missing"
+    },
+    {
+      "path": "/client/ipaddr/delete/:hs_name/:vm_uuid/:int:ip_index",
+      "methods": [
+        "DELETE"
+      ],
+      "status": "path_missing"
+    },
+    {
+      "path": "/client/proxys/delete/:hs_name/:vm_uuid/:int:proxy_index",
+      "methods": [
+        "DELETE"
+      ],
+      "status": "path_missing"
+    },
+    {
+      "path": "/admin/proxys/update/:hs_name/:vm_uuid/:int:proxy_index",
+      "methods": [
+        "PUT"
+      ],
+      "status": "path_missing"
+    },
+    {
+      "path": "/admin/proxys/delete/:hs_name/:vm_uuid/:int:proxy_index",
+      "methods": [
+        "DELETE"
+      ],
+      "status": "path_missing"
+    },
+    {
+      "path": "/users/:int:user_id",
+      "methods": [
+        "DELETE",
+        "GET",
+        "PUT"
+      ],
+      "status": "path_missing"
+    }
+  ],
+  "extra_in_go": [
+    {
+      "path": "/csrf-token",
+      "methods": [
+        "GET"
+      ]
+    },
+    {
+      "path": "/client/natdel/:hs_name/:vm_uuid/:rule_index",
+      "methods": [
+        "DELETE"
+      ]
+    },
+    {
+      "path": "/client/ipaddr/delete/:hs_name/:vm_uuid/:ip_index",
+      "methods": [
+        "DELETE"
+      ]
+    },
+    {
+      "path": "/client/proxys/delete/:hs_name/:vm_uuid/:proxy_index",
+      "methods": [
+        "DELETE"
+      ]
+    },
+    {
+      "path": "/admin/proxys/update/:hs_name/:vm_uuid/:proxy_index",
+      "methods": [
+        "PUT"
+      ]
+    },
+    {
+      "path": "/admin/proxys/delete/:hs_name/:vm_uuid/:proxy_index",
+      "methods": [
+        "DELETE"
+      ]
+    },
+    {
+      "path": "/users/:user_id",
+      "methods": [
+        "DELETE",
+        "GET",
+        "PUT"
+      ]
+    },
+    {
+      "path": "/tasks",
+      "methods": [
+        "GET"
+      ]
+    },
+    {
+      "path": "/tasks/stats",
+      "methods": [
+        "GET"
+      ]
+    },
+    {
+      "path": "/tasks/:task_id",
+      "methods": [
+        "GET"
+      ]
+    },
+    {
+      "path": "/tasks/:task_id/cancel",
+      "methods": [
+        "POST"
+      ]
+    },
+    {
+      "path": "/tasks/:task_id/stop",
+      "methods": [
+        "POST"
+      ]
+    }
+  ]
+}
