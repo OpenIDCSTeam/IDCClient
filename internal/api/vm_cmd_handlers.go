@@ -4,10 +4,11 @@ package api
 import (
 	"fmt"
 	"net/http"
+	"net/url"
 	"time"
 
+	"github.com/OpenIDCSTeam/HostAgent-Go/internal/auth"
 	"github.com/OpenIDCSTeam/HostAgent-Go/pkg/utils"
-	"github.com/gin-contrib/sessions"
 	"github.com/gin-gonic/gin"
 	"github.com/google/uuid"
 )
@@ -19,15 +20,13 @@ func (app *App) handleVMCmdSend(c *gin.Context) {
 	hsName := c.Param("hs_name")
 	vmUUID := c.Param("vm_uuid")
 
-	// 检查主机访问权限
-	username := c.GetString("username")
-	if !app.HostSvc.CheckHostAccess(username, hsName) {
-		utils.Forbidden(c)
+	// 授权已由 HostVMAccessMiddleware 统一执行，这里按统一规则再复核一次
+	uc := auth.GetUserContext(c)
+	if uc == nil {
+		utils.Unauthorized(c)
 		return
 	}
-
-	// 检查虚拟机所有权
-	if !app.HostSvc.CheckVMOwnership(username, hsName, vmUUID) {
+	if !app.canOperateVM(uc, hsName, vmUUID) {
 		utils.Fail(c, 403, "无权操作此虚拟机")
 		return
 	}
@@ -75,9 +74,12 @@ func (app *App) handleVMCmdSend(c *gin.Context) {
 // POST /api/client/cmd_result
 // Body: {"cmd_id": "...", "command": "...", "success": true, "exit_code": 0, ...}
 func (app *App) handleVMCmdResult(c *gin.Context) {
+	// 公开接口：限制请求体大小，避免被用于内存放大
+	c.Request.Body = http.MaxBytesReader(c.Writer, c.Request.Body, 256*1024)
+
 	var result map[string]interface{}
 	if err := c.ShouldBindJSON(&result); err != nil {
-		utils.BadRequest(c, "无效的结果数据")
+		utils.BadRequest(c, "无效的结果数据或请求体过大")
 		return
 	}
 
@@ -127,15 +129,12 @@ func (app *App) handleVMCmdStatus(c *gin.Context) {
 	hsName := c.Param("hs_name")
 	vmUUID := c.Param("vm_uuid")
 
-	// 检查主机访问权限
-	username := c.GetString("username")
-	if !app.HostSvc.CheckHostAccess(username, hsName) {
-		utils.Forbidden(c)
+	uc := auth.GetUserContext(c)
+	if uc == nil {
+		utils.Unauthorized(c)
 		return
 	}
-
-	// 检查虚拟机所有权
-	if !app.HostSvc.CheckVMOwnership(username, hsName, vmUUID) {
+	if !app.canOperateVM(uc, hsName, vmUUID) {
 		utils.Fail(c, 403, "无权操作此虚拟机")
 		return
 	}
@@ -155,6 +154,13 @@ func (app *App) handleVMCmdStatus(c *gin.Context) {
 // handleVMTempToken 生成临时访问凭据
 // GET /api/client/temptoken/:hs_name/:vm_uuid
 // 需要 Bearer Token 认证（用于外部系统集成）
+//
+// 响应同时兼容两套字段命名（历史遗留的外部插件/自动化插件都在使用）：
+//   - Python 版：temp_token / expire（FSPlugins/OpenIDC-IDCSmart、OpenIDC-SwapIDC）
+//   - Go 版旧字段：token / expire_in / login_url
+//
+// 虚拟用户名固定为 {hs_name}-{vm_uuid}，与 Python 版一致：
+// 前端 user_permissions 直接读取 own_all[虚拟用户]，命名不一致会拿到 0 权限。
 func (app *App) handleVMTempToken(c *gin.Context) {
 	hsName := c.Param("hs_name")
 	vmUUID := c.Param("vm_uuid")
@@ -167,36 +173,53 @@ func (app *App) handleVMTempToken(c *gin.Context) {
 		return
 	}
 
-	// 检查虚拟机是否存在
+	// 校验标识格式：该标识会参与用户名拼接与日志记录
+	if !vmUUIDLooksSafe(vmUUID) {
+		utils.BadRequest(c, "虚拟机标识无效")
+		return
+	}
+
+	// 检查虚拟机是否存在（注意：配置缺失时必须返回不存在）
 	if !app.HostSvc.VMExists(hsName, vmUUID) {
 		utils.NotFound(c, "虚拟机不存在")
 		return
 	}
 
-	// 生成虚拟用户名（temp_用户名_时间戳）
-	virtualUser := fmt.Sprintf("temp_%s_%d", vmUUID[:8], time.Now().Unix())
+	// 虚拟用户名与访问密钥登录保持一致，并确保 own_all 中存在对应权限掩码
+	virtualUser, err := app.HostSvc.EnsureVMTempVirtualUser(hsName, vmUUID)
+	if err != nil {
+		utils.NotFound(c, err.Error())
+		return
+	}
 
-	// 生成临时令牌（5分钟有效期）
-	token := app.TempTokenStore.Generate(hsName, vmUUID, virtualUser)
+	// 生成临时令牌（5分钟有效期，一次性使用）
+	token, expire := app.TempTokenStore.GenerateWithExpire(hsName, vmUUID, virtualUser)
 
 	app.Logger.Log("temptoken", "INFO", "临时凭据", fmt.Sprintf("[临时凭据] 已生成临时令牌: %s/%s", hsName, vmUUID), true)
 
+	loginURL := fmt.Sprintf("/api/client/templogin?token=%s", url.QueryEscape(token))
 	utils.SuccessMsg(c, "临时凭据生成成功", gin.H{
-		"token":       token,
-		"hs_name":     hsName,
-		"vm_uuid":     vmUUID,
-		"expire_in":   300, // 秒
-		"login_url":   fmt.Sprintf("/api/client/templogin?token=%s", token),
+		// Python 兼容字段（外部插件读取 temp_token / expire）
+		"temp_token": token,
+		"expire":     expire.Unix(),
+		// Go 版历史字段，保持向后兼容
+		"token":     token,
+		"expire_in": int(time.Until(expire).Seconds()),
+		"login_url": loginURL,
+		"jump_url":  loginURL,
+		"hs_name":   hsName,
+		"vm_uuid":   vmUUID,
 	})
 }
 
 // handleVMTempLogin 临时凭据登录跳转
-// GET /api/client/templogin?token=xxx
-// POST /api/client/templogin Body: {"token": "xxx"}
+//
+//	GET  /api/client/templogin?token=xxx      —— 直链（token 会进入访问日志）
+//	POST /api/client/templogin {"token":""}   —— token 在请求体中，不写入访问日志
+//	GET  /api/client/templogin                —— 返回中间页，由 JS 从 #t=xxx 读取后 POST
 func (app *App) handleVMTempLogin(c *gin.Context) {
-	// 支持 GET 和 POST
 	token := c.Query("token")
-	if token == "" && c.Request.Method == "POST" {
+	if token == "" && c.Request.Method == http.MethodPost {
 		var req struct {
 			Token string `json:"token"`
 		}
@@ -206,53 +229,58 @@ func (app *App) handleVMTempLogin(c *gin.Context) {
 	}
 
 	if token == "" {
-		c.HTML(http.StatusBadRequest, "", "<h3>缺少 token 参数</h3>")
+		// 无 token：返回 hash 中间页，token 由 JS 从 location.hash 读取后 POST，
+		// 避免一次性凭据出现在服务端访问日志与浏览器历史中。
+		landing := `<!DOCTYPE html>
+<html>
+<head><meta charset="utf-8"><title>正在跳转...</title></head>
+<body>
+<script>
+(function () {
+  var params = {};
+  location.hash.replace(/^#/, '').split('&').forEach(function (kv) {
+    var p = kv.split('=');
+    if (p[0]) { params[p[0]] = decodeURIComponent(p[1] || ''); }
+  });
+  var token = params['t'] || params['token'];
+  if (!token) { document.body.innerText = '缺少临时凭据'; return; }
+  fetch('/api/client/templogin', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ token: token })
+  }).then(function (r) { return r.text(); })
+    .then(function (html) { document.open(); document.write(html); document.close(); })
+    .catch(function (e) { document.body.innerText = '登录失败: ' + e; });
+})();
+</script>
+</body>
+</html>`
+		c.Header("Content-Type", "text/html; charset=utf-8")
+		c.String(http.StatusOK, landing)
 		return
 	}
 
 	// 消费临时令牌（一次性）
 	hsName, vmUUID, virtualUser, ok := app.TempTokenStore.Consume(token)
 	if !ok {
-		c.HTML(http.StatusUnauthorized, "", "<h3>临时凭据无效或已过期</h3>")
+		renderVMLoginError(c, http.StatusUnauthorized, "临时凭据无效或已过期")
+		return
+	}
+	if !app.HostSvc.VMExists(hsName, vmUUID) {
+		renderVMLoginError(c, http.StatusNotFound, "临时凭据对应的虚拟机不存在")
 		return
 	}
 
 	app.Logger.Log("temptoken", "INFO", "临时凭据", fmt.Sprintf("[临时凭据] 临时用户 %s 登录: %s/%s", virtualUser, hsName, vmUUID), true)
 
-	// 创建临时会话
-	session := sessions.Default(c)
-	session.Set("username", virtualUser)
-	session.Set("is_admin", false)
-	session.Set("temp_login", true)
-	session.Set("temp_hs_name", hsName)
-	session.Set("temp_vm_uuid", vmUUID)
-	if err := session.Save(); err != nil {
+	// 建立受限会话并跳转到虚拟机管理页面（与访问密钥登录共用同一套逻辑）
+	if err := app.startVMLimitedSession(c, hsName, vmUUID, virtualUser); err != nil {
 		app.Logger.Log("temptoken", "ERROR", "临时凭据", fmt.Sprintf("[临时凭据] 保存会话失败: %v", err), false)
-		c.HTML(http.StatusInternalServerError, "", "<h3>登录失败</h3>")
+		renderVMLoginError(c, http.StatusInternalServerError, "登录失败")
 		return
 	}
 
-	// 跳转到虚拟机控制台
-	redirectURL := fmt.Sprintf("/#/console?hs_name=%s&vm_uuid=%s", hsName, vmUUID)
-	
-	// 返回 HTML 跳转页面
-	html := fmt.Sprintf(`<!DOCTYPE html>
-<html>
-<head>
-    <meta charset="utf-8">
-    <title>登录中...</title>
-    <script>
-        window.location.href = '%s';
-    </script>
-</head>
-<body>
-    <h3>登录成功，正在跳转到虚拟机控制台...</h3>
-    <p>如果未自动跳转，请<a href="%s">点击这里</a></p>
-</body>
-</html>`, redirectURL, redirectURL)
-	
-	c.Header("Content-Type", "text/html; charset=utf-8")
-	c.String(http.StatusOK, html)
+	app.renderVMLoginRedirect(c, hsName, vmUUID, virtualUser)
 }
 
 // min 返回两个整数中的较小值

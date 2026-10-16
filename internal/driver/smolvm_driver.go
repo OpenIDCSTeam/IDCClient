@@ -324,7 +324,7 @@ exec /bin/sh
 	// 生成密码哈希并写入 shadow
 	if rootPass != "" {
 		ok, out, _ := d.execHost(fmt.Sprintf("openssl passwd -6 '%s' 2>/dev/null || openssl passwd -1 '%s'",
-			rootPass, rootPass), 10*time.Second)
+			shEscape(rootPass), shEscape(rootPass)), 10*time.Second)
 		if ok {
 			hash := strings.TrimSpace(out)
 			lines := strings.Split(hash, "\n")
@@ -529,6 +529,22 @@ func (d *SmolVMDriver) assembleVM(cfg *model.VMConfig, sock, rootfs string) erro
 		"drive_id": "rootfs", "path_on_host": rootfs,
 		"is_root_device": true, "is_read_only": false}); err != nil || code >= 400 {
 		return fmt.Errorf("/drives/rootfs code=%d err=%v", code, err)
+	}
+
+	// 数据盘：Firecracker 以额外 drive 形式挂载（已挂载的才下发）
+	for name, hdd := range cfg.HddAll {
+		if hdd.HddFlag != 1 {
+			continue
+		}
+		p := hdd.HddPath
+		if p == "" {
+			p = filepath.ToSlash(filepath.Join(d.vmDir(cfg.VmUUID), name+".ext4"))
+		}
+		if code, _, err := d.fcDo(sock, "PUT", "/drives/"+name, map[string]interface{}{
+			"drive_id": name, "path_on_host": p,
+			"is_root_device": false, "is_read_only": false}); err != nil || code >= 400 {
+			return fmt.Errorf("/drives/%s code=%d err=%v", name, code, err)
+		}
 	}
 	mac := ""
 	for _, nic := range cfg.NicAll {
@@ -750,6 +766,11 @@ func (d *SmolVMDriver) ScanVMs() (*model.ZMessage, error) {
 
 // SetPassword 设置 root 密码（在线走 SSH，离线挂载 rootfs 改 shadow）
 func (d *SmolVMDriver) SetPassword(vmUUID string, password string) (*model.ZMessage, error) {
+	// 标识会参与宿主机目录与命令拼接，必须先校验
+	if err := safeIdent(vmUUID, 128); err != nil {
+		return &model.ZMessage{Success: false, Action: "Password",
+			Message: "microVM 标识无效: " + err.Error()}, nil
+	}
 	d.mu.RLock()
 	cfg, ok := d.VmSaving[vmUUID]
 	d.mu.RUnlock()
@@ -772,9 +793,15 @@ func (d *SmolVMDriver) SetPassword(vmUUID string, password string) (*model.ZMess
 			return &model.ZMessage{Success: false, Action: "Password",
 				Message: "microVM 未分配 IP"}, nil
 		}
+		// 口令进入本地 shell 命令串，必须转义；
+		// IP 只接受合法地址，避免被拼成主机名或附加参数。
+		if net.ParseIP(strings.TrimSpace(vmIP)) == nil {
+			return &model.ZMessage{Success: false, Action: "Password",
+				Message: "microVM 的 IP 地址无效"}, nil
+		}
 		cmd := fmt.Sprintf(
 			"sshpass -p '%s' ssh -o StrictHostKeyChecking=no root@%s \"echo 'root:%s' | chpasswd\"",
-			password, vmIP, password)
+			shEscape(password), vmIP, shEscape(password))
 		if ok2, _, err := d.execHost(cmd, 30*time.Second); !ok2 {
 			return &model.ZMessage{Success: false, Action: "Password",
 				Message: fmt.Sprintf("在线改密失败: %s", err)}, nil
@@ -797,7 +824,8 @@ func (d *SmolVMDriver) SetPassword(vmUUID string, password string) (*model.ZMess
 			mnt, mnt, mnt), 10*time.Second)
 	}()
 	okp, out, _ := d.execHost(fmt.Sprintf(
-		"openssl passwd -6 '%s' 2>/dev/null || openssl passwd -1 '%s'", password, password), 10*time.Second)
+		"openssl passwd -6 '%s' 2>/dev/null || openssl passwd -1 '%s'",
+		shEscape(password), shEscape(password)), 10*time.Second)
 	if !okp {
 		return &model.ZMessage{Success: false, Action: "Password",
 			Message: "openssl 生成密文失败"}, nil
@@ -888,7 +916,18 @@ func (d *SmolVMDriver) RestoreBackup(vmUUID string, backupName string) (*model.Z
 
 // DeleteBackup 删除备份
 func (d *SmolVMDriver) DeleteBackup(vmUUID string, backupName string) (*model.ZMessage, error) {
-	path := filepath.ToSlash(filepath.Join(d.Config.BackupPath, backupName))
+	// 只取文件名本身并绑定虚拟机前缀：
+	// 原实现直接把请求值拼进 rm -f，可用 ../../ 删除备份目录之外的文件。
+	name, err := sanitizeFileName(backupName)
+	if err != nil || !strings.HasPrefix(name, vmUUID+"-") {
+		return &model.ZMessage{Success: false, Action: "RMBackup",
+			Message: "备份名称无效或与目标虚拟机不匹配"}, nil
+	}
+	if strings.TrimSpace(d.Config.BackupPath) == "" {
+		return &model.ZMessage{Success: false, Action: "RMBackup",
+			Message: "主机未配置备份路径"}, nil
+	}
+	path := filepath.ToSlash(filepath.Join(d.Config.BackupPath, name))
 	d.execHost(fmt.Sprintf("rm -f \"%s\"", path), 5*time.Second)
 	return &model.ZMessage{Success: true, Action: "RMBackup",
 		Message: "备份已删除"}, nil

@@ -102,22 +102,37 @@ func HSConfigFromJSON(data []byte) (*HSConfig, error) {
 	return cfg, nil
 }
 
-// HWStatus 硬件状态
+// HWStatus 硬件状态。
+//
+// 字段与 Python 版 MainObject/Public/HWStatus.py 的 __save__ 输出保持一致，
+// 前端 HostManage.tsx 的 HostStatus 接口按这些 key 渲染：
+//
+//	ext_usage : {挂载点: [总量MB, 已用MB]}
+//	gpu_usage : {显卡标识: 使用率%}
+//	gpu_total : 显卡数量
+//	network_a : 物理网卡速率(Mbps)
 type HWStatus struct {
-	CpuModel  string  `json:"cpu_model"`  // CPU型号
-	CpuTotal  int     `json:"cpu_total"`  // CPU核心数
-	CpuUsage  int     `json:"cpu_usage"`  // CPU使用率(%)
-	MemTotal  int     `json:"mem_total"`  // 内存总量(MB)
-	MemUsage  int     `json:"mem_usage"`  // 内存使用(MB)
-	HddTotal  int     `json:"hdd_total"`  // 磁盘总量(MB)
-	HddUsage  int     `json:"hdd_usage"`  // 磁盘使用(MB)
-	FluUsage  int     `json:"flu_usage"`  // 流量使用(MB)
-	NetworkU  int     `json:"network_u"`  // 上行带宽(Mbps)
-	NetworkD  int     `json:"network_d"`  // 下行带宽(Mbps)
-	VmState   string  `json:"vm_state"`   // 虚拟机状态
-	OnUpdate  int64   `json:"on_update"`  // 更新时间戳
-	GpuUsage  float64 `json:"gpu_usage"`  // GPU使用率(%)
-	GpuMemory int     `json:"gpu_memory"` // GPU显存(MB)
+	CpuModel  string             `json:"cpu_model"`  // CPU型号
+	CpuTotal  int                `json:"cpu_total"`  // CPU核心数
+	CpuUsage  int                `json:"cpu_usage"`  // CPU使用率(%)
+	CpuHeats  int                `json:"cpu_heats"`  // CPU温度(℃)
+	CpuPower  int                `json:"cpu_power"`  // CPU功耗(%)
+	MemTotal  int                `json:"mem_total"`  // 内存总量(MB)
+	MemUsage  int                `json:"mem_usage"`  // 内存使用(MB)
+	HddTotal  int                `json:"hdd_total"`  // 主盘总量(MB)
+	HddUsage  int                `json:"hdd_usage"`  // 主盘使用(MB)
+	ExtUsage  map[string][]int   `json:"ext_usage"`  // 数据盘 {挂载点:[总MB,已用MB]}
+	FluTotal  int                `json:"flu_total"`  // 流量总额(MB)
+	FluUsage  int                `json:"flu_usage"`  // 流量使用(MB)
+	NetworkU  int                `json:"network_u"`  // 上行带宽(KB/s)
+	NetworkD  int                `json:"network_d"`  // 下行带宽(KB/s)
+	NetworkA  int                `json:"network_a"`  // 物理网卡速率(Mbps)
+	GpuTotal  int                `json:"gpu_total"`  // 显卡数量
+	GpuUsage  map[string]float64 `json:"gpu_usage"`  // GPU使用率 {标识: %}
+	GpuMemory int                `json:"gpu_memory"` // GPU显存(MB)
+	AcStatus  string             `json:"ac_status"`  // 电源状态
+	VmState   string             `json:"vm_state"`   // 虚拟机状态
+	OnUpdate  int64              `json:"on_update"`  // 更新时间戳
 }
 
 // ZMessage 统一消息结构

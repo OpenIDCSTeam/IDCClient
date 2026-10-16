@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"net"
 	"sync"
+	"time"
 
 	"github.com/OpenIDCSTeam/HostAgent-Go/internal/auth"
 	"github.com/OpenIDCSTeam/HostAgent-Go/internal/data"
@@ -14,11 +15,28 @@ import (
 	"github.com/OpenIDCSTeam/HostAgent-Go/pkg/utils"
 )
 
+// statusCacheTTL 主机状态缓存时间。
+// 前端每 10 秒轮询一次状态；采集需要访问平台 API 或执行系统命令，
+// 缓存 30 秒既保证展示接近实时，又避免重复采集（与 Python 版 get_host 的
+// 30 秒新鲜度窗口一致）。
+const statusCacheTTL = 30 * time.Second
+
+// hostStatusCacheEntry 主机状态缓存条目
+type hostStatusCacheEntry struct {
+	status   *model.HWStatus
+	cachedAt time.Time
+}
+
 // HostService 主机管理服务
 type HostService struct {
 	db      *data.DB
 	drivers map[string]driver.HostDriver // hs_name -> driver
 	mu      sync.RWMutex
+	// initMu 串行化驱动的惰性创建，避免并发首次访问重复构造同一主机驱动
+	initMu sync.Mutex
+	// statusMu/statusCache 主机状态短缓存
+	statusMu    sync.Mutex
+	statusCache map[string]*hostStatusCacheEntry
 }
 
 // NewHostService 创建主机管理服务
@@ -103,17 +121,136 @@ func (s *HostService) DeleteHost(hsName string) error {
 }
 
 // SetHostEnable 设置主机启用状态
+// 与 Python HostManager.pwr_host 一致：启用时加载驱动（HSLoader），禁用时卸载驱动（HSUnload）。
+// 缺少这一步会出现「已启用但无法管理虚拟机」或「已禁用仍可管理」的现象。
 func (s *HostService) SetHostEnable(hsName string, enable bool) error {
-	return s.db.SetHostEnable(hsName, enable)
+	if err := s.db.SetHostEnable(hsName, enable); err != nil {
+		return err
+	}
+
+	if !enable {
+		// 禁用：卸载驱动，后续请求将无法访问该主机
+		s.mu.Lock()
+		delete(s.drivers, hsName)
+		s.mu.Unlock()
+		return nil
+	}
+
+	// 启用：立即加载驱动，无需等待调度器扫描或手动调用 /api/system/loader
+	row, err := s.db.GetHost(hsName)
+	if err != nil || row == nil {
+		return fmt.Errorf("主机 %s 不存在", hsName)
+	}
+	cfg, err := rowToHSConfig(row)
+	if err != nil {
+		return fmt.Errorf("解析主机配置失败: %w", err)
+	}
+	cfg.EnableHost = true
+	s.initDriver(cfg)
+	return nil
 }
 
-// GetHostStatus 获取主机状态
+// GetHostStatus 获取主机状态（内部使用，返回原始结构）
 func (s *HostService) GetHostStatus(hsName string) (interface{}, error) {
 	d := s.getDriver(hsName)
 	if d == nil {
 		return nil, fmt.Errorf("主机 %s 未找到或未启用", hsName)
 	}
 	return d.GetStatus()
+}
+
+// GetHostStatusPayload 返回与 Python 版 get_host_status 一致的响应体。
+//
+// 前端读取的是 data.status（见 HostManage.tsx），因此必须包一层：
+//
+//	{status: {...}, source: "driver"|"cache"|"db"|"disabled", cached_at, age_seconds}
+//
+// 原实现直接返回 HWStatus，导致 data.status 恒为 undefined，
+// 前端 hostsStatus 始终为空 —— 表现为「获取不到主机状态信息」。
+func (s *HostService) GetHostStatusPayload(hsName string, refresh bool) (map[string]interface{}, error) {
+	row, err := s.db.GetHost(hsName)
+	if err != nil || row == nil {
+		return nil, fmt.Errorf("主机 %s 不存在", hsName)
+	}
+	now := time.Now()
+
+	// 禁用主机不采集状态
+	if row.EnableHost == 0 {
+		return map[string]interface{}{
+			"status":      map[string]interface{}{},
+			"source":      "disabled",
+			"cached_at":   now.Unix(),
+			"age_seconds": 0,
+		}, nil
+	}
+
+	if !refresh {
+		s.statusMu.Lock()
+		entry := s.statusCache[hsName]
+		s.statusMu.Unlock()
+		if entry != nil && now.Sub(entry.cachedAt) < statusCacheTTL {
+			return map[string]interface{}{
+				"status":      entry.status,
+				"source":      "cached",
+				"cached_at":   entry.cachedAt.Unix(),
+				"age_seconds": int(now.Sub(entry.cachedAt).Seconds()),
+			}, nil
+		}
+	}
+
+	d := s.GetOrCreateDriver(hsName)
+	if d == nil {
+		return s.statusFromDB(hsName, now), nil
+	}
+
+	hw, statusErr := d.GetStatus()
+	if statusErr != nil || hw == nil {
+		return s.statusFromDB(hsName, now), nil
+	}
+	if hw.OnUpdate == 0 {
+		hw.OnUpdate = now.Unix()
+	}
+
+	// 仅在采集到有效数据时落库与缓存（全 0 不覆盖历史，与 Python 版一致）
+	if hw.CpuTotal > 0 || hw.MemTotal > 0 {
+		_ = s.db.AddHSStatus(hsName, hw)
+		s.statusMu.Lock()
+		if s.statusCache == nil {
+			s.statusCache = make(map[string]*hostStatusCacheEntry)
+		}
+		s.statusCache[hsName] = &hostStatusCacheEntry{status: hw, cachedAt: now}
+		s.statusMu.Unlock()
+	}
+
+	return map[string]interface{}{
+		"status":      hw,
+		"source":      "driver",
+		"cached_at":   now.Unix(),
+		"age_seconds": 0,
+	}, nil
+}
+
+// statusFromDB 采集不可用时回退到最近一次落库的状态
+func (s *HostService) statusFromDB(hsName string, now time.Time) map[string]interface{} {
+	list, err := s.db.GetHSStatus(hsName, 1)
+	if err != nil || len(list) == 0 {
+		return map[string]interface{}{
+			"status":      map[string]interface{}{},
+			"source":      "error",
+			"cached_at":   now.Unix(),
+			"age_seconds": 0,
+		}
+	}
+	var status interface{}
+	if err := json.Unmarshal([]byte(list[0]), &status); err != nil || status == nil {
+		status = map[string]interface{}{}
+	}
+	return map[string]interface{}{
+		"status":      status,
+		"source":      "db",
+		"cached_at":   now.Unix(),
+		"age_seconds": 0,
+	}
 }
 
 // GetHostAreas 获取所有主机区域列表
@@ -200,15 +337,37 @@ func (s *HostService) GetAvailablePorts(hsName string) (map[string]interface{}, 
 // 驱动管理
 // ============================================================
 
-// initDriver 初始化主机驱动
+// initDriver 初始化主机驱动（并从数据库恢复虚拟机配置）
 func (s *HostService) initDriver(cfg *model.HSConfig) {
 	d := driver.NewDriver(cfg)
 	if d == nil {
 		return
 	}
+	s.restoreVMSaving(cfg.ServerName, d)
 	s.mu.Lock()
 	s.drivers[cfg.ServerName] = d
 	s.mu.Unlock()
+}
+
+// restoreVMSaving 从数据库恢复驱动内存中的虚拟机配置
+// 对应 Python BasicServer.HSLoader 中 vm_saving 的加载逻辑。
+// 缺少这一步会导致服务重启或主机重新加载后「看不到、也无法管理已有的虚拟机」。
+func (s *HostService) restoreVMSaving(hsName string, d driver.HostDriver) {
+	rows, err := s.db.GetVMSaving(hsName)
+	if err != nil || len(rows) == 0 {
+		return
+	}
+	vms := make(map[string]*model.VMConfig, len(rows))
+	for vmUUID, vmJSON := range rows {
+		vm, decodeErr := DecodeVMConfig(vmJSON)
+		if decodeErr != nil || vm == nil {
+			continue
+		}
+		vms[vmUUID] = vm
+	}
+	if len(vms) > 0 {
+		d.SetVMSaving(vms)
+	}
 }
 
 // getDriver 获取主机驱动
@@ -219,7 +378,37 @@ func (s *HostService) getDriver(hsName string) driver.HostDriver {
 }
 
 // GetDriver 公开获取驱动（供API层使用）
+// 未加载时按数据库配置惰性创建（仅限已启用主机），
+// 保证服务重启后无需等待调度器扫描即可正常管理主机与虚拟机。
 func (s *HostService) GetDriver(hsName string) driver.HostDriver {
+	return s.GetOrCreateDriver(hsName)
+}
+
+// GetOrCreateDriver 获取驱动，未加载时按数据库配置惰性创建（仅限已启用主机）。
+//
+// 使用独立的初始化锁并二次检查：原实现是「检查不存在 → 构造 → 覆盖」，
+// 并发首次访问会重复创建驱动，导致同一主机出现两套内存状态与锁。
+func (s *HostService) GetOrCreateDriver(hsName string) driver.HostDriver {
+	if d := s.getDriver(hsName); d != nil {
+		return d
+	}
+
+	s.initMu.Lock()
+	defer s.initMu.Unlock()
+
+	// 二次检查：可能已被其它协程创建
+	if d := s.getDriver(hsName); d != nil {
+		return d
+	}
+	row, err := s.db.GetHost(hsName)
+	if err != nil || row == nil || row.EnableHost == 0 {
+		return nil
+	}
+	cfg, err := rowToHSConfig(row)
+	if err != nil {
+		return nil
+	}
+	s.initDriver(cfg)
 	return s.getDriver(hsName)
 }
 
@@ -372,6 +561,70 @@ func parseOSList(raw string) []model.OSConfig {
 		}
 	}
 	return result
+}
+
+// ParseOSList 导出：将 system_maps/images_maps 的 JSON 解析为 []OSConfig
+// 兼容新版列表格式与前端旧版「名称 -> 值」映射格式
+func ParseOSList(raw string) []model.OSConfig {
+	return parseOSList(raw)
+}
+
+// OSListToArray 将 []OSConfig 转换为接口返回的数组形式。
+//
+// 与 Python 版 get_os_images 的 _os_list_dump 语义一致：
+// system_maps / images_maps 均为 list[OSConfig]，并过滤显式禁用的镜像（sys_flag=false）。
+//
+// 注意：此前导出的是「名称 -> 值」映射，与前端契约不符 ——
+// 前端把 system_maps 声明为 OSConfigItem[] 并直接调用 .filter/.find
+// （见 DockCreateModal.tsx、HostManage.tsx），收到对象会抛出
+// "hostImages.filter is not a function" 并导致创建弹窗崩溃。
+func OSListToArray(list []model.OSConfig) []model.OSConfig {
+	result := make([]model.OSConfig, 0, len(list))
+	for _, item := range list {
+		if item.SysName == "" || !item.SysFlag {
+			continue
+		}
+		result = append(result, item)
+	}
+	return result
+}
+
+// NormalizeOSMaps 就地把请求体中的 system_maps / images_maps 统一为 []OSConfig。
+// 前端提交的是「名称 -> 值」映射，直接反序列化到 []OSConfig 会报类型错误。
+func NormalizeOSMaps(raw map[string]interface{}) {
+	for _, key := range []string{"system_maps", "images_maps"} {
+		v, ok := raw[key]
+		if !ok {
+			continue
+		}
+		if _, isList := v.([]model.OSConfig); isList {
+			continue
+		}
+		data, err := json.Marshal(v)
+		if err != nil {
+			continue
+		}
+		raw[key] = parseOSList(string(data))
+	}
+}
+
+// HSConfigToAPI 将主机配置转换为接口返回结构
+// 字段与 Python HSConfig.__save__() 一致，但 system_maps/images_maps 使用前端的映射形式
+func HSConfigToAPI(cfg *model.HSConfig) map[string]interface{} {
+	out := make(map[string]interface{})
+	if cfg == nil {
+		return out
+	}
+	data, err := json.Marshal(cfg)
+	if err != nil {
+		return out
+	}
+	if err := json.Unmarshal(data, &out); err != nil {
+		return make(map[string]interface{})
+	}
+	out["system_maps"] = OSListToArray(cfg.SystemMaps)
+	out["images_maps"] = OSListToArray(cfg.ImagesMaps)
+	return out
 }
 
 func hsConfigToRow(cfg *model.HSConfig) (*data.HSConfigRow, error) {

@@ -4,8 +4,10 @@ package api
 import (
 	"fmt"
 
-	"github.com/OpenIDCSTeam/HostAgent-Go/pkg/utils"
 	"github.com/gin-gonic/gin"
+
+	"github.com/OpenIDCSTeam/HostAgent-Go/internal/auth"
+	"github.com/OpenIDCSTeam/HostAgent-Go/pkg/utils"
 )
 
 // handleSyncPush 同步推送虚拟机配置（远端主机推送到本地）
@@ -14,9 +16,13 @@ import (
 func (app *App) handleSyncPush(c *gin.Context) {
 	hsName := c.Param("hs_name")
 
-	// 检查主机访问权限
-	username := c.GetString("username")
-	if !app.HostSvc.CheckHostAccess(username, hsName) {
+	// 主机访问权限：使用认证上下文中的真实用户名
+	uc := auth.GetUserContext(c)
+	if uc == nil {
+		utils.Unauthorized(c)
+		return
+	}
+	if !app.HostSvc.CheckHostAccess(uc.Username, hsName) {
 		utils.Forbidden(c)
 		return
 	}

@@ -3,40 +3,58 @@ package utils
 
 import (
 	"net/http"
+	"time"
 
 	"github.com/gin-gonic/gin"
 )
 
-// Response 统一响应结构
+// Response 统一响应结构。
+//
+// 与 Python 版 RestManager.api_response 保持一致：
+// {code, msg, data, timestamp}，HTTP 状态码恒为 200，业务语义由 code 表达。
+// 前端（React）基于 Python 版协议开发，因此这里必须保持同样的契约，
+// 否则 axios 会因非 2xx 直接进入异常分支而拿不到 code。
 type Response struct {
-	Code int         `json:"code"`
-	Msg  string      `json:"msg"`
-	Data interface{} `json:"data,omitempty"`
+	Code      int         `json:"code"`
+	Msg       string      `json:"msg"`
+	Data      interface{} `json:"data,omitempty"`
+	Timestamp int64       `json:"timestamp"`
+}
+
+// now 返回秒级时间戳，与 Python 版 int(time.time()) 对齐
+func now() int64 {
+	return time.Now().Unix()
 }
 
 // Success 返回成功响应
 func Success(c *gin.Context, data interface{}) {
 	c.JSON(http.StatusOK, Response{
-		Code: 200,
-		Msg:  "成功",
-		Data: data,
+		Code:      200,
+		Msg:       "成功",
+		Data:      data,
+		Timestamp: now(),
 	})
 }
 
 // SuccessMsg 返回带消息的成功响应
 func SuccessMsg(c *gin.Context, msg string, data interface{}) {
 	c.JSON(http.StatusOK, Response{
-		Code: 200,
-		Msg:  msg,
-		Data: data,
+		Code:      200,
+		Msg:       msg,
+		Data:      data,
+		Timestamp: now(),
 	})
 }
 
-// Fail 返回失败响应
+// Fail 返回失败响应。
+//
+// 保持 HTTP 200 + 业务码的形态以兼容既有前端；
+// 失败可观测性通过日志与监控指标补充，而不是改变响应协议。
 func Fail(c *gin.Context, code int, msg string) {
 	c.JSON(http.StatusOK, Response{
-		Code: code,
-		Msg:  msg,
+		Code:      code,
+		Msg:       msg,
+		Timestamp: now(),
 	})
 }
 

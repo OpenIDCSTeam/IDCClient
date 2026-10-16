@@ -9,6 +9,9 @@ import (
 	"math/rand"
 	"net"
 	"net/http"
+	"os"
+	"path/filepath"
+	"strings"
 	"sync"
 	"time"
 
@@ -127,8 +130,8 @@ var NormalizePowerState = map[string]model.VMPowers{
 	"关闭中": model.VMPowerOnStop,
 	"保存中": model.VMPowerOnSave,
 	"恢复中": model.VMPowerOnWake,
-	"未知":   model.VMPowerUnknown,
-	"":     model.VMPowerUnknown,
+	"未知":  model.VMPowerUnknown,
+	"":    model.VMPowerUnknown,
 }
 
 // VMPowerToString 将 VMPowers 枚举转为中文状态字符串
@@ -159,6 +162,7 @@ type BaseDriver struct {
 	Config   *model.HSConfig
 	VmSaving map[string]*model.VMConfig
 	mu       sync.RWMutex
+	self     HostDriver // 最外层驱动实例（用于模拟 Python 虚方法派发）
 }
 
 // NewBaseDriver 创建基础驱动
@@ -169,20 +173,204 @@ func NewBaseDriver(cfg *model.HSConfig) *BaseDriver {
 	}
 }
 
+// SetSelf 记录最外层驱动实例（由 NewDriver 在构造后调用）
+// 用于基类通用实现中派发到平台覆盖的方法，模拟 Python 的虚方法调用
+func (b *BaseDriver) SetSelf(d HostDriver) {
+	b.mu.Lock()
+	b.self = d
+	b.mu.Unlock()
+}
+
+// SelfDriver 返回最外层驱动实例（可能为 nil）
+func (b *BaseDriver) SelfDriver() HostDriver {
+	b.mu.RLock()
+	defer b.mu.RUnlock()
+	return b.self
+}
+
 // GetConfig 获取主机配置
 func (b *BaseDriver) GetConfig() *model.HSConfig {
 	return b.Config
 }
 
-// GetVMSaving 获取虚拟机配置map
+// CloneVMConfig 深复制虚拟机配置。
+//
+// 仅复制外层 map 是不安全的：调用方拿到内部指针后会在锁外修改
+// VmFlag、NicAll、NatAll、OwnAll 等字段，与调度器采集并发时
+// 会产生数据竞争、丢更新，甚至并发读写 map 的运行时错误。
+func CloneVMConfig(src *model.VMConfig) *model.VMConfig {
+	if src == nil {
+		return nil
+	}
+	dst := *src
+
+	if src.FluRst != nil {
+		dst.FluRst = append([]int(nil), src.FluRst...)
+	}
+	if src.NicAll != nil {
+		dst.NicAll = make(map[string]model.NCConfig, len(src.NicAll))
+		for k, v := range src.NicAll {
+			dst.NicAll[k] = v
+		}
+	}
+	if src.HddAll != nil {
+		dst.HddAll = make(map[string]model.SDConfig, len(src.HddAll))
+		for k, v := range src.HddAll {
+			dst.HddAll[k] = v
+		}
+	}
+	if src.IsoAll != nil {
+		dst.IsoAll = make(map[string]model.IMConfig, len(src.IsoAll))
+		for k, v := range src.IsoAll {
+			dst.IsoAll[k] = v
+		}
+	}
+	if src.PciAll != nil {
+		dst.PciAll = make(map[string]model.VFConfig, len(src.PciAll))
+		for k, v := range src.PciAll {
+			dst.PciAll[k] = v
+		}
+	}
+	if src.UsbAll != nil {
+		dst.UsbAll = make(map[string]model.USBInfos, len(src.UsbAll))
+		for k, v := range src.UsbAll {
+			dst.UsbAll[k] = v
+		}
+	}
+	if src.OwnAll != nil {
+		dst.OwnAll = make(map[string]model.UserMask, len(src.OwnAll))
+		for k, v := range src.OwnAll {
+			dst.OwnAll[k] = v
+		}
+	}
+	if src.EfiAll != nil {
+		dst.EfiAll = append([]model.BootOpts(nil), src.EfiAll...)
+	}
+	if src.NatAll != nil {
+		dst.NatAll = append([]model.PortData(nil), src.NatAll...)
+	}
+	if src.WebAll != nil {
+		dst.WebAll = append([]model.WebProxy(nil), src.WebAll...)
+	}
+	if src.Backups != nil {
+		dst.Backups = append([]model.VMBackup(nil), src.Backups...)
+	}
+	if src.VmCmd != nil {
+		dst.VmCmd = make(map[string]interface{}, len(src.VmCmd))
+		for k, v := range src.VmCmd {
+			dst.VmCmd[k] = v
+		}
+	}
+	if src.VmCmdResult != nil {
+		dst.VmCmdResult = make(map[string]interface{}, len(src.VmCmdResult))
+		for k, v := range src.VmCmdResult {
+			dst.VmCmdResult[k] = v
+		}
+	}
+	if src.ExtData != nil {
+		dst.ExtData = make(map[string]interface{}, len(src.ExtData))
+		for k, v := range src.ExtData {
+			dst.ExtData[k] = v
+		}
+	}
+	return &dst
+}
+
+// GetVMSaving 获取虚拟机配置快照（返回深复制，可安全在锁外读写）
 func (b *BaseDriver) GetVMSaving() map[string]*model.VMConfig {
 	b.mu.RLock()
 	defer b.mu.RUnlock()
 	result := make(map[string]*model.VMConfig, len(b.VmSaving))
 	for k, v := range b.VmSaving {
-		result[k] = v
+		result[k] = CloneVMConfig(v)
 	}
 	return result
+}
+
+// RemoveVMSaving 在锁内移除一条虚拟机内存记录。
+//
+// 只移除本机（HostAgent）侧的纳管记录，不做任何平台操作，
+// 供「清理不匹配 filter_name 的历史记录」「仅移除记录」等场景使用。
+func (b *BaseDriver) RemoveVMSaving(vmUUID string) bool {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	if _, ok := b.VmSaving[vmUUID]; !ok {
+		return false
+	}
+	delete(b.VmSaving, vmUUID)
+	return true
+}
+
+// UpsertVMSaving 在锁内写入/替换单条虚拟机记录。
+//
+// 供「合并重复记录」等维护操作把合并结果回写到驱动内存，
+// 避免后续列表接口用内存中的旧对象覆盖数据库里的合并结果。
+func (b *BaseDriver) UpsertVMSaving(vmUUID string, cfg *model.VMConfig) {
+	if vmUUID == "" || cfg == nil {
+		return
+	}
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	b.VmSaving[vmUUID] = cfg
+}
+
+// MatchFilterPrefix 判断一条虚拟机记录是否匹配主机配置的名称前缀（filter_name）。
+//
+// 前缀为空表示不过滤（与各驱动 ScanVMs 的语义一致）。
+//
+// 各平台存放名称的字段不同：ESXi/Hyper-V/Workstation 等写入 OsName，
+// 而 Proxmox 驱动直接把名称（"-" 已替换为 "_"）当作 VmUUID，
+// 因此这里对两个字段都做匹配，并把 "_" 与 "-" 视为等价，
+// 避免清理历史记录时误删本应保留的虚拟机。
+func MatchFilterPrefix(prefix string, cfg *model.VMConfig) bool {
+	prefix = strings.TrimSpace(prefix)
+	if prefix == "" {
+		return true
+	}
+	if cfg == nil {
+		return false
+	}
+	normalize := func(s string) string { return strings.ReplaceAll(s, "_", "-") }
+	target := normalize(prefix)
+	for _, name := range []string{cfg.OsName, cfg.VmUUID} {
+		if name == "" {
+			continue
+		}
+		if strings.HasPrefix(normalize(name), target) {
+			return true
+		}
+	}
+	return false
+}
+
+// SetVMDeleted 在锁内更新虚拟机的扫描软删除标记。
+//
+// 扫描时平台侧已不存在的虚拟机只标记不删除，
+// 保留所有者、端口映射等业务字段，平台侧重新出现时可恢复。
+func (b *BaseDriver) SetVMDeleted(vmUUID string, deleted bool) bool {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	cfg, ok := b.VmSaving[vmUUID]
+	if !ok {
+		return false
+	}
+	cfg.VmDeleted = deleted
+	return true
+}
+
+// SetVMPowerState 在锁内更新虚拟机电源状态。
+//
+// 调度器只应通过该方法刷新状态，而不是修改快照对象：
+// 快照是复制品，直接修改不会写回驱动，也会造成状态长期不更新。
+func (b *BaseDriver) SetVMPowerState(vmUUID string, state model.VMPowers) bool {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	cfg, ok := b.VmSaving[vmUUID]
+	if !ok {
+		return false
+	}
+	cfg.VmFlag = state
+	return true
 }
 
 // SetVMSaving 设置虚拟机配置（从数据库恢复时调用）
@@ -197,7 +385,7 @@ func (b *BaseDriver) GetVMList() (map[string]*model.VMConfig, error) {
 	return b.GetVMSaving(), nil
 }
 
-// GetVMDetail 获取虚拟机详情
+// GetVMDetail 获取虚拟机详情（返回深复制，调用方可自由修改后经 UpdateVM 写回）
 func (b *BaseDriver) GetVMDetail(vmUUID string) (*model.VMConfig, error) {
 	b.mu.RLock()
 	defer b.mu.RUnlock()
@@ -205,7 +393,7 @@ func (b *BaseDriver) GetVMDetail(vmUUID string) (*model.VMConfig, error) {
 	if !ok {
 		return nil, fmt.Errorf("虚拟机 %s 不存在", vmUUID)
 	}
-	return cfg, nil
+	return CloneVMConfig(cfg), nil
 }
 
 // GetPower 获取虚拟机电源状态（默认返回未知，子类覆盖）
@@ -213,9 +401,16 @@ func (b *BaseDriver) GetPower(vmUUID string) string {
 	return "未知"
 }
 
-// GetStatus 获取主机状态（默认返回空状态，子类覆盖）
+// GetStatus 获取主机状态。
+//
+// 默认采集本机状态，与 Python 版 BasicServer.HSStatus() → local_get_hw_status() 一致。
+// 原实现只返回时间戳，导致未覆盖该方法的平台（Hyper-V / QEMU / VirtualBox /
+// MEmu / VMware Workstation 等）主机状态恒为全 0，前端显示不出任何数据。
+//
+// 远程平台（Proxmox / ESXi / 青州云）必须覆写本方法，使用平台 API 采集，
+// 否则会把 IDCClient 本机资源误报为远程主机状态。
 func (b *BaseDriver) GetStatus() (*model.HWStatus, error) {
-	return &model.HWStatus{OnUpdate: time.Now().Unix()}, nil
+	return localHWStatus(), nil
 }
 
 // GetScreenshot 获取截图（默认返回空，子类覆盖）
@@ -250,14 +445,79 @@ func (b *BaseDriver) GetUSBList() (map[string]*model.USBInfos, error) {
 	return make(map[string]*model.USBInfos), nil
 }
 
-// SetupPCI PCI直通（默认实现，子类覆盖）
+// SetupPCI PCI直通（默认实现：记录到配置，需关机）
+// 与 Python 版 BasicServer.PCISetup 语义一致：校验关机状态后增删 pci_all
 func (b *BaseDriver) SetupPCI(vmUUID string, cfg *model.VFConfig, pciKey string, add bool) (*model.ZMessage, error) {
-	return &model.ZMessage{Success: false, Action: "PCISetup", Message: "当前平台不支持PCI直通"}, nil
+	b.mu.Lock()
+	defer b.mu.Unlock()
+
+	vmCfg, ok := b.VmSaving[vmUUID]
+	if !ok {
+		return &model.ZMessage{Success: false, Action: "PCISetup", Message: "虚拟机不存在"}, nil
+	}
+	// PCI 直通需要先关机
+	switch vmCfg.VmFlag {
+	case model.VMPowerStopped, model.VMPowerOnStop, model.VMPowerUnknown:
+		// 允许
+	default:
+		return &model.ZMessage{Success: false, Action: "PCISetup", Message: "PCI直通需要先关闭虚拟机"}, nil
+	}
+	if vmCfg.PciAll == nil {
+		vmCfg.PciAll = make(map[string]model.VFConfig)
+	}
+
+	if add {
+		if _, exists := vmCfg.PciAll[pciKey]; exists {
+			return &model.ZMessage{Success: false, Action: "PCISetup", Message: "PCI设备已存在"}, nil
+		}
+		vmCfg.PciAll[pciKey] = *cfg
+	} else {
+		if _, exists := vmCfg.PciAll[pciKey]; !exists {
+			return &model.ZMessage{Success: false, Action: "PCISetup", Message: "PCI设备不存在"}, nil
+		}
+		delete(vmCfg.PciAll, pciKey)
+	}
+
+	action := "添加"
+	if !add {
+		action = "移除"
+	}
+	return &model.ZMessage{Success: true, Action: "PCISetup",
+		Message: "PCI设备" + action + "成功"}, nil
 }
 
-// SetupUSB USB直通（默认实现，子类覆盖）
+// SetupUSB USB直通（默认实现：记录到配置，无需关机）
+// 与 Python 版 BasicServer.USBSetup 语义一致：增删 usb_all
 func (b *BaseDriver) SetupUSB(vmUUID string, info *model.USBInfos, usbKey string, add bool) (*model.ZMessage, error) {
-	return &model.ZMessage{Success: false, Action: "USBSetup", Message: "当前平台不支持USB直通"}, nil
+	b.mu.Lock()
+	defer b.mu.Unlock()
+
+	vmCfg, ok := b.VmSaving[vmUUID]
+	if !ok {
+		return &model.ZMessage{Success: false, Action: "USBMount", Message: "虚拟机不存在"}, nil
+	}
+	if vmCfg.UsbAll == nil {
+		vmCfg.UsbAll = make(map[string]model.USBInfos)
+	}
+
+	if add {
+		if _, exists := vmCfg.UsbAll[usbKey]; exists {
+			return &model.ZMessage{Success: false, Action: "USBMount", Message: "USB设备KEY已存在"}, nil
+		}
+		vmCfg.UsbAll[usbKey] = *info
+	} else {
+		if _, exists := vmCfg.UsbAll[usbKey]; !exists {
+			return &model.ZMessage{Success: false, Action: "USBMount", Message: "USB设备不存在"}, nil
+		}
+		delete(vmCfg.UsbAll, usbKey)
+	}
+
+	action := "挂载"
+	if !add {
+		action = "卸载"
+	}
+	return &model.ZMessage{Success: true, Action: "USBMount",
+		Message: "USB设备" + action + "成功"}, nil
 }
 
 // MountHDD 挂载数据盘（默认实现）
@@ -284,33 +544,151 @@ func (b *BaseDriver) MountHDD(vmUUID string, hdd *model.SDConfig, mount bool) (*
 	return &model.ZMessage{Success: true, Action: "HDDMount", Message: "磁盘" + action + "成功"}, nil
 }
 
-// DeleteHDD 删除数据盘（默认实现）
-func (b *BaseDriver) DeleteHDD(vmUUID string, hddName string) (*model.ZMessage, error) {
-	b.mu.Lock()
-	defer b.mu.Unlock()
-	cfg, ok := b.VmSaving[vmUUID]
-	if !ok {
-		return &model.ZMessage{Success: false, Action: "RMMounts", Message: "虚拟机不存在"}, nil
-	}
-	delete(cfg.HddAll, hddName)
-	return &model.ZMessage{Success: true, Action: "RMMounts", Message: "磁盘删除成功"}, nil
+// hddFilePath 返回数据盘在宿主文件系统中的路径。
+//
+// 与 Python 版 BasicServer.RMMounts / HDDTrans 的命名约定一致：
+//
+//	<system_path>/<vm_uuid>/<vm_uuid>-<hdd_name>.vmdk
+//
+// 平台驱动若使用其它存储（qcow2 / vdi / 平台卷）应自行覆写 DeleteHDD / TransferHDD。
+func (b *BaseDriver) hddFilePath(vmUUID, hddName string) string {
+	return filepath.Join(b.Config.SystemPath, vmUUID, vmUUID+"-"+hddName+".vmdk")
 }
 
-// TransferHDD 移交数据盘（默认实现）
-func (b *BaseDriver) TransferHDD(vmUUID string, hdd *model.SDConfig, targetVM string) (*model.ZMessage, error) {
-	b.mu.Lock()
-	defer b.mu.Unlock()
+// HDDCheck 数据盘移交前置校验。
+//
+// 与 Python 版 BasicServer.HDDCheck 完全一致：
+//  1. 源虚拟机必须存在
+//  2. 目标虚拟机必须存在
+//  3. 待移交磁盘必须存在于源虚拟机
+//  4. 磁盘必须处于「未挂载」状态（已挂载需先卸载）
+func (b *BaseDriver) HDDCheck(vmUUID string, hdd *model.SDConfig, targetVM string) (*model.ZMessage, error) {
+	if hdd == nil || strings.TrimSpace(hdd.HddName) == "" {
+		return &model.ZMessage{Success: false, Action: "HDDTrans", Message: "磁盘信息不完整"}, nil
+	}
+
+	b.mu.RLock()
+	defer b.mu.RUnlock()
+
 	src, ok := b.VmSaving[vmUUID]
 	if !ok {
 		return &model.ZMessage{Success: false, Action: "HDDTrans", Message: "原始虚拟机不存在"}, nil
 	}
-	dst, ok := b.VmSaving[targetVM]
-	if !ok {
+	if _, ok := b.VmSaving[targetVM]; !ok {
 		return &model.ZMessage{Success: false, Action: "HDDTrans", Message: "目标虚拟机不存在"}, nil
 	}
-	delete(src.HddAll, hdd.HddName)
-	hdd.HddFlag = 0
-	dst.HddAll[hdd.HddName] = *hdd
+	conf, ok := src.HddAll[hdd.HddName]
+	if !ok {
+		return &model.ZMessage{Success: false, Action: "HDDTrans", Message: "待移交磁盘不存在"}, nil
+	}
+	if conf.HddFlag == 1 {
+		return &model.ZMessage{Success: false, Action: "HDDTrans", Message: "请先卸载此磁盘"}, nil
+	}
+	return &model.ZMessage{Success: true, Action: "HDDTrans", Message: "磁盘可以移交"}, nil
+}
+
+// DeleteHDD 删除数据盘（默认实现，与 Python 版 BasicServer.RMMounts 一致）。
+//
+// 步骤：已挂载则先卸载 → 从配置移除 → 删除宿主机上的真实磁盘文件。
+// 平台驱动若使用非文件型存储（Proxmox 卷、云 API 磁盘）应覆写本方法。
+func (b *BaseDriver) DeleteHDD(vmUUID string, hddName string) (*model.ZMessage, error) {
+	if strings.TrimSpace(hddName) == "" {
+		return &model.ZMessage{Success: false, Action: "RMMounts", Message: "磁盘名称不能为空"}, nil
+	}
+
+	b.mu.RLock()
+	cfg, ok := b.VmSaving[vmUUID]
+	var hdd model.SDConfig
+	if ok {
+		hdd = cfg.HddAll[hddName]
+	}
+	b.mu.RUnlock()
+
+	if !ok {
+		return &model.ZMessage{Success: false, Action: "RMMounts", Message: "虚拟机不存在"}, nil
+	}
+	if hdd.HddName == "" {
+		return &model.ZMessage{Success: false, Action: "RMMounts", Message: "虚拟盘不存在"}, nil
+	}
+
+	// 已挂载则先卸载
+	if hdd.HddFlag == 1 {
+		self := b.SelfDriver()
+		if self == nil {
+			return &model.ZMessage{Success: false, Action: "RMMounts",
+				Message: "驱动未初始化，无法卸载磁盘"}, nil
+		}
+		if msg, err := self.MountHDD(vmUUID, &hdd, false); err != nil {
+			return &model.ZMessage{Success: false, Action: "RMMounts",
+				Message: "卸载磁盘失败: " + err.Error()}, nil
+		} else if msg != nil && !msg.Success {
+			return &model.ZMessage{Success: false, Action: "RMMounts",
+				Message: "卸载磁盘失败: " + msg.Message}, nil
+		}
+	}
+
+	// 从配置移除
+	b.mu.Lock()
+	delete(cfg.HddAll, hddName)
+	b.mu.Unlock()
+
+	// 删除真实磁盘文件（仅文件型存储）
+	path := hdd.HddPath
+	if path == "" {
+		path = b.hddFilePath(vmUUID, hdd.HddName)
+	}
+	if err := os.Remove(path); err != nil && !os.IsNotExist(err) {
+		return &model.ZMessage{Success: false, Action: "RMMounts",
+			Message: "删除磁盘文件失败: " + err.Error()}, nil
+	}
+
+	return &model.ZMessage{Success: true, Action: "RMMounts", Message: "磁盘删除成功"}, nil
+}
+
+// TransferHDD 移交数据盘（默认实现，与 Python 版 BasicServer.HDDTrans 一致）。
+//
+// 步骤：HDDCheck 校验 → 把磁盘文件从源虚拟机的系统目录移动到目标虚拟机的系统目录
+// → 源配置移除、目标配置新增（保持未挂载状态）。
+// 平台驱动若使用非文件型存储应覆写本方法。
+func (b *BaseDriver) TransferHDD(vmUUID string, hdd *model.SDConfig, targetVM string) (*model.ZMessage, error) {
+	check, err := b.HDDCheck(vmUUID, hdd, targetVM)
+	if err != nil || check == nil || !check.Success {
+		return check, err
+	}
+	if vmUUID == targetVM {
+		return &model.ZMessage{Success: false, Action: "HDDTrans", Message: "源与目标虚拟机相同"}, nil
+	}
+
+	oldPath := b.hddFilePath(vmUUID, hdd.HddName)
+	newPath := b.hddFilePath(targetVM, hdd.HddName)
+
+	// 移动物理文件（源文件不存在时仅迁移配置，与 Python 的告警行为一致）
+	if _, statErr := os.Stat(oldPath); statErr == nil {
+		if err := os.MkdirAll(filepath.Dir(newPath), 0755); err != nil {
+			return &model.ZMessage{Success: false, Action: "HDDTrans",
+				Message: "创建目标目录失败: " + err.Error()}, nil
+		}
+		if err := os.Rename(oldPath, newPath); err != nil {
+			return &model.ZMessage{Success: false, Action: "HDDTrans",
+				Message: "移动磁盘文件失败: " + err.Error()}, nil
+		}
+	}
+
+	b.mu.Lock()
+	if src, ok := b.VmSaving[vmUUID]; ok {
+		delete(src.HddAll, hdd.HddName)
+	}
+	if dst, ok := b.VmSaving[targetVM]; ok {
+		if dst.HddAll == nil {
+			dst.HddAll = make(map[string]model.SDConfig)
+		}
+		moved := *hdd
+		moved.HddFlag = 0
+		moved.HddPath = newPath
+		dst.HddAll[hdd.HddName] = moved
+	}
+	b.mu.Unlock()
+
 	return &model.ZMessage{Success: true, Action: "HDDTrans", Message: "磁盘移交成功"}, nil
 }
 
@@ -337,26 +715,6 @@ func (b *BaseDriver) MountISO(vmUUID string, iso *model.IMConfig, mount bool) (*
 // MountUSB 挂载/卸载USB存储（默认实现）
 func (b *BaseDriver) MountUSB(vmUUID string, usbKey string, mount bool) (*model.ZMessage, error) {
 	return &model.ZMessage{Success: false, Action: "USBMount", Message: "当前平台不支持USB存储"}, nil
-}
-
-// CreateBackup 创建备份（默认实现）
-func (b *BaseDriver) CreateBackup(vmUUID string, tips string) (*model.ZMessage, error) {
-	return &model.ZMessage{Success: false, Action: "VMBackup", Message: "当前平台不支持备份"}, nil
-}
-
-// RestoreBackup 还原备份（默认实现）
-func (b *BaseDriver) RestoreBackup(vmUUID string, backupName string) (*model.ZMessage, error) {
-	return &model.ZMessage{Success: false, Action: "Restores", Message: "当前平台不支持备份还原"}, nil
-}
-
-// DeleteBackup 删除备份（默认实现）
-func (b *BaseDriver) DeleteBackup(vmUUID string, backupName string) (*model.ZMessage, error) {
-	return &model.ZMessage{Success: false, Action: "RMBackup", Message: "当前平台不支持备份删除"}, nil
-}
-
-// ScanBackups 扫描备份（默认实现）
-func (b *BaseDriver) ScanBackups() (*model.ZMessage, error) {
-	return &model.ZMessage{Success: true, Action: "LDBackup", Message: "扫描完成"}, nil
 }
 
 // SetPassword 设置密码（默认实现，子类覆盖）

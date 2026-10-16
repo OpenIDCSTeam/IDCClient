@@ -13,24 +13,30 @@ const (
 	TaskStatusPending   TaskStatus = "pending"    // 等待执行
 	TaskStatusRunning   TaskStatus = "running"    // 执行中
 	TaskStatusCompleted TaskStatus = "completed"  // 已完成
-	TaskStatusFailed    TaskStatus = "failed"     // 失败
-	TaskStatusCancelled TaskStatus = "cancelled"  // 已取消
+	TaskStatusFailed    TaskStatus = "failed"    // 失败
+	// TaskStatusStopped 与 Python 版 TaskManager.stop_task 一致：
+	// 用户终止的任务状态是 stopped，而不是 cancelled。
+	TaskStatusStopped TaskStatus = "stopped"
+	// TaskStatusCancelled 兼容历史数据
+	TaskStatusCancelled TaskStatus = "cancelled"
 )
 
 // TaskType 任务类型
 type TaskType string
 
 const (
-	TaskTypeVMCreate    TaskType = "vm.create"     // 创建虚拟机
-	TaskTypeVMReinstall TaskType = "vm.reinstall"  // 重装虚拟机
-	TaskTypeVMDelete    TaskType = "vm.delete"     // 删除虚拟机
-	TaskTypeVMBackup    TaskType = "vm.backup"     // 备份虚拟机
-	TaskTypeVMRestore   TaskType = "vm.restore"    // 还原虚拟机
-	TaskTypeVMSnapshot  TaskType = "vm.snapshot"   // 创建快照
-	TaskTypeVMClone     TaskType = "vm.clone"      // 克隆虚拟机
-	TaskTypeVMUpdate    TaskType = "vm.update"     // 更新虚拟机配置
-	TaskTypeHostScan    TaskType = "host.scan"     // 扫描主机
-	TaskTypeBackupScan  TaskType = "backup.scan"   // 扫描备份
+	TaskTypeVMCreate    TaskType = "create_vm"    // 创建虚拟机
+	TaskTypeVMReinstall TaskType = "reinstall_vm" // 重装虚拟机
+	TaskTypeVMDelete    TaskType = "delete_vm"    // 删除虚拟机
+	TaskTypeVMBackup    TaskType = "backup_vm"    // 备份虚拟机
+	TaskTypeVMRestore   TaskType = "restore_vm"   // 还原虚拟机
+	TaskTypeVMSnapshot  TaskType = "snapshot_vm"  // 创建快照
+	TaskTypeVMClone     TaskType = "clone_vm"     // 克隆虚拟机
+	TaskTypeVMUpdate    TaskType = "update_vm"    // 更新虚拟机配置
+	TaskTypeVMPassword  TaskType = "password_vm"  // 修改密码
+	TaskTypeVMPower     TaskType = "power_vm"     // 电源操作
+	TaskTypeHostScan    TaskType = "scan_host"    // 扫描主机
+	TaskTypeBackupScan  TaskType = "scan_backup"  // 扫描备份
 )
 
 // Task 任务模型
@@ -45,6 +51,8 @@ type Task struct {
 	Error       string                 `json:"error"`        // 错误信息
 	Metadata    map[string]interface{} `json:"metadata"`     // 任务元数据 (JSON)
 	CreatedBy   string                 `json:"created_by"`   // 创建用户
+	HsName      string                 `json:"hs_name"`      // 目标主机
+	VmUUID      string                 `json:"vm_uuid"`      // 目标虚拟机
 	CreatedAt   time.Time              `json:"created_at"`   // 创建时间
 	StartedAt   *time.Time             `json:"started_at"`   // 开始时间
 	CompletedAt *time.Time             `json:"completed_at"` // 完成时间
@@ -71,6 +79,8 @@ type TaskFilter struct {
 	Status    []TaskStatus `json:"status"`     // 状态过滤
 	Type      []TaskType   `json:"type"`       // 类型过滤
 	CreatedBy string       `json:"created_by"` // 创建用户过滤
+	HsName    string       `json:"hs_name"`    // 主机过滤
+	VmUUID    string       `json:"vm_uuid"`    // 虚拟机过滤
 	Limit     int          `json:"limit"`      // 返回数量限制
 	Offset    int          `json:"offset"`     // 分页偏移
 }
@@ -93,10 +103,49 @@ func FromJSON(jsonStr string) (*Task, error) {
 	return &task, nil
 }
 
-// IsTerminal 判断任务是否已终止（完成、失败或取消）
+// MarshalJSON 输出与 Python 版任务字典一致的字段。
+//
+// Python 任务字段：task_id, hs_name, vm_uuid, task_type, status,
+// params, result, error_message, created_at, started_at, finished_at。
+// 同时保留 Go 侧原有字段，避免已有调用方解析失败。
+func (t *Task) MarshalJSON() ([]byte, error) {
+	out := map[string]interface{}{
+		"task_id":       t.ID,
+		"id":            t.ID,
+		"name":          t.Name,
+		"task_type":     string(t.Type),
+		"type":          string(t.Type),
+		"status":        string(t.Status),
+		"progress":      t.Progress,
+		"message":       t.Message,
+		"result":        t.Result,
+		"error":         t.Error,
+		"error_message": t.Error,
+		"params":        t.Metadata,
+		"metadata":      t.Metadata,
+		"created_by":    t.CreatedBy,
+		"created_at":    t.CreatedAt,
+		"started_at":    t.StartedAt,
+		"finished_at":   t.CompletedAt,
+		"completed_at":  t.CompletedAt,
+	}
+	// 主机与虚拟机标识存放在 Metadata 中，提升为顶层字段供前端直接使用
+	if t.Metadata != nil {
+		if v, ok := t.Metadata["hs_name"].(string); ok {
+			out["hs_name"] = v
+		}
+		if v, ok := t.Metadata["vm_uuid"].(string); ok {
+			out["vm_uuid"] = v
+		}
+	}
+	return json.Marshal(out)
+}
+
+// IsTerminal 判断任务是否已终止（完成、失败或已终止）
 func (t *Task) IsTerminal() bool {
 	return t.Status == TaskStatusCompleted ||
 		t.Status == TaskStatusFailed ||
+		t.Status == TaskStatusStopped ||
 		t.Status == TaskStatusCancelled
 }
 

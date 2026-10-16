@@ -16,6 +16,8 @@ const (
 	TaskStatusRunning   TaskStatus = "running"
 	TaskStatusCompleted TaskStatus = "completed"
 	TaskStatusFailed    TaskStatus = "failed"
+	// TaskStatusStopped 用户主动终止（与 Python 版一致）
+	TaskStatusStopped   TaskStatus = "stopped"
 	TaskStatusCancelled TaskStatus = "cancelled"
 )
 
@@ -34,6 +36,8 @@ type Task struct {
 	Error       string                 `json:"error"`
 	Metadata    map[string]interface{} `json:"metadata"`
 	CreatedBy   string                 `json:"created_by"`
+	HsName      string                 `json:"hs_name"`
+	VmUUID      string                 `json:"vm_uuid"`
 	CreatedAt   time.Time              `json:"created_at"`
 	StartedAt   *time.Time             `json:"started_at"`
 	CompletedAt *time.Time             `json:"completed_at"`
@@ -44,6 +48,8 @@ type TaskFilter struct {
 	Status    []TaskStatus `json:"status"`
 	Type      []TaskType   `json:"type"`
 	CreatedBy string       `json:"created_by"`
+	HsName    string       `json:"hs_name"`
+	VmUUID    string       `json:"vm_uuid"`
 	Limit     int          `json:"limit"`
 	Offset    int          `json:"offset"`
 }
@@ -53,15 +59,17 @@ func (d *DB) SaveTask(
 	id, name, taskType, status string,
 	progress int,
 	message, result, errorMsg, metadata, createdBy string,
+	hsName, vmUUID string,
 	createdAt time.Time,
 	startedAt, completedAt *time.Time,
 ) error {
 	query := `
 		INSERT INTO async_tasks (
 			id, name, type, status, progress, message, 
-			result, error, metadata, created_by, 
+			result, error, metadata, created_by,
+			hs_name, vm_uuid,
 			created_at, started_at, completed_at
-		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 		ON CONFLICT(id) DO UPDATE SET
 			status = excluded.status,
 			progress = excluded.progress,
@@ -69,6 +77,8 @@ func (d *DB) SaveTask(
 			result = excluded.result,
 			error = excluded.error,
 			metadata = excluded.metadata,
+			hs_name = excluded.hs_name,
+			vm_uuid = excluded.vm_uuid,
 			started_at = excluded.started_at,
 			completed_at = excluded.completed_at
 	`
@@ -77,6 +87,7 @@ func (d *DB) SaveTask(
 		query,
 		id, name, taskType, status, progress, message,
 		result, errorMsg, metadata, createdBy,
+		hsName, vmUUID,
 		createdAt, startedAt, completedAt,
 	)
 	return err
@@ -87,6 +98,7 @@ func (d *DB) GetTask(taskID string) (*Task, error) {
 	query := `
 		SELECT id, name, type, status, progress, message,
 		       result, error, metadata, created_by,
+		       COALESCE(hs_name,''), COALESCE(vm_uuid,''),
 		       created_at, started_at, completed_at
 		FROM async_tasks
 		WHERE id = ?
@@ -100,6 +112,7 @@ func (d *DB) GetTask(taskID string) (*Task, error) {
 		&task.ID, &task.Name, &task.Type, &task.Status,
 		&task.Progress, &task.Message,
 		&resultJSON, &task.Error, &metadataJSON, &task.CreatedBy,
+		&task.HsName, &task.VmUUID,
 		&task.CreatedAt, &startedAt, &completedAt,
 	)
 
@@ -130,6 +143,7 @@ func (d *DB) ListTasks(filter TaskFilter) ([]*Task, int, error) {
 	query := `
 		SELECT id, name, type, status, progress, message,
 		       result, error, metadata, created_by,
+		       COALESCE(hs_name,''), COALESCE(vm_uuid,''),
 		       created_at, started_at, completed_at
 		FROM async_tasks
 		WHERE 1=1
@@ -174,6 +188,20 @@ func (d *DB) ListTasks(filter TaskFilter) ([]*Task, int, error) {
 		args = append(args, filter.CreatedBy)
 	}
 
+	// 主机过滤
+	if filter.HsName != "" {
+		query += " AND hs_name = ?"
+		countQuery += " AND hs_name = ?"
+		args = append(args, filter.HsName)
+	}
+
+	// 虚拟机过滤
+	if filter.VmUUID != "" {
+		query += " AND vm_uuid = ?"
+		countQuery += " AND vm_uuid = ?"
+		args = append(args, filter.VmUUID)
+	}
+
 	// 获取总数
 	var total int
 	err := d.db.QueryRow(countQuery, args...).Scan(&total)
@@ -210,6 +238,7 @@ func (d *DB) ListTasks(filter TaskFilter) ([]*Task, int, error) {
 			&task.ID, &task.Name, &task.Type, &task.Status,
 			&task.Progress, &task.Message,
 			&resultJSON, &task.Error, &metadataJSON, &task.CreatedBy,
+			&task.HsName, &task.VmUUID,
 			&task.CreatedAt, &startedAt, &completedAt,
 		)
 		if err != nil {

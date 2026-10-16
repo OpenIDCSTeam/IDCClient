@@ -5,6 +5,7 @@ import (
 	"context"
 	"fmt"
 	"net/url"
+	"strings"
 	"time"
 
 	"github.com/OpenIDCSTeam/HostAgent-Go/internal/model"
@@ -454,14 +455,7 @@ func (d *ESXiDriver) GetVMList() (map[string]*model.VMConfig, error) {
 	return result, nil
 }
 
-// ReinstallVM 重装虚拟机系统
-func (d *ESXiDriver) ReinstallVM(cfg *model.VMConfig) (*model.ZMessage, error) {
-	return &model.ZMessage{
-		Success: false,
-		Action:  "VMReinstall",
-		Message: "ESXi平台暂不支持系统重装",
-	}, nil
-}
+// ReinstallVM 已迁移至 esxi_ext.go（真实实现：删除旧系统盘 → 重建 → 启动）。
 
 // UpdateVM 更新虚拟机配置
 func (d *ESXiDriver) UpdateVM(cfg *model.VMConfig, oldCfg *model.VMConfig) (*model.ZMessage, error) {
@@ -522,7 +516,10 @@ func (d *ESXiDriver) UpdateVM(cfg *model.VMConfig, oldCfg *model.VMConfig) (*mod
 	}, nil
 }
 
-// GetVMDetail 获取虚拟机详情
+// GetVMDetail 获取虚拟机详情。
+//
+// 返回深复制：原实现把内部指针交给调用方，调用方在锁外修改会与
+// 调度器采集并发，产生数据竞争与丢更新（与其他驱动保持一致）。
 func (d *ESXiDriver) GetVMDetail(vmUUID string) (*model.VMConfig, error) {
 	d.mu.RLock()
 	cfg, ok := d.VmSaving[vmUUID]
@@ -530,10 +527,13 @@ func (d *ESXiDriver) GetVMDetail(vmUUID string) (*model.VMConfig, error) {
 	if !ok {
 		return nil, fmt.Errorf("虚拟机 %s 不存在", vmUUID)
 	}
-	return cfg, nil
+	return CloneVMConfig(cfg), nil
 }
 
 // ScanVMs 扫描并同步虚拟机列表
+//
+// 与 Python 版 vSphereESXi.VMDetect 对齐：使用主机配置的 filter_name
+// 作为名称前缀过滤，只纳管带该前缀的虚拟机。
 func (d *ESXiDriver) ScanVMs() (*model.ZMessage, error) {
 	vms, err := d.GetVMList()
 	if err != nil {
@@ -544,6 +544,17 @@ func (d *ESXiDriver) ScanVMs() (*model.ZMessage, error) {
 		}, nil
 	}
 
+	// 前缀过滤（未配置 filter_name 时不过滤）
+	prefix := d.Config.FilterName
+	scanned := 0
+	for uuid, cfg := range vms {
+		if prefix != "" && (cfg == nil || !strings.HasPrefix(cfg.OsName, prefix)) {
+			delete(vms, uuid)
+			continue
+		}
+		scanned++
+	}
+
 	d.mu.Lock()
 	d.VmSaving = vms
 	d.mu.Unlock()
@@ -551,7 +562,7 @@ func (d *ESXiDriver) ScanVMs() (*model.ZMessage, error) {
 	return &model.ZMessage{
 		Success: true,
 		Action:  "VMDetect",
-		Message: fmt.Sprintf("扫描完成，共发现 %d 台虚拟机", len(vms)),
+		Message: fmt.Sprintf("扫描完成：匹配 %d 台", scanned),
 	}, nil
 }
 
@@ -605,23 +616,8 @@ func (d *ESXiDriver) CreateBackup(vmUUID string, tips string) (*model.ZMessage, 
 	}, nil
 }
 
-// RestoreBackup 还原备份
-func (d *ESXiDriver) RestoreBackup(vmUUID string, backupName string) (*model.ZMessage, error) {
-	return &model.ZMessage{
-		Success: false,
-		Action:  "Restores",
-		Message: "ESXi平台暂不支持快照还原",
-	}, nil
-}
-
-// DeleteBackup 删除备份
-func (d *ESXiDriver) DeleteBackup(vmUUID string, backupName string) (*model.ZMessage, error) {
-	return &model.ZMessage{
-		Success: false,
-		Action:  "RMBackup",
-		Message: "ESXi平台暂不支持快照删除",
-	}, nil
-}
+// RestoreBackup / DeleteBackup 已迁移至 esxi_ext.go
+// （真实实现：RevertToSnapshot / RemoveSnapshot）。
 
 // GetVNCInfo 获取VNC信息（ESXi使用VMRC）
 func (d *ESXiDriver) GetVNCInfo(vmUUID string, ipAddr string) (*model.ZMessage, error) {
@@ -658,11 +654,7 @@ func (d *ESXiDriver) GetVNCInfo(vmUUID string, ipAddr string) (*model.ZMessage, 
 	}, nil
 }
 
-// GetScreenshot 获取虚拟机截图
-func (d *ESXiDriver) GetScreenshot(vmUUID string) (string, error) {
-	// ESXi平台暂不支持直接获取截图
-	return "", fmt.Errorf("ESXi平台暂不支持截图功能")
-}
+// GetScreenshot 已迁移至 esxi_ext.go（CreateScreenshot_Task 真实实现）。
 
 // Crontab 定时任务（状态同步）
 func (d *ESXiDriver) Crontab() bool {

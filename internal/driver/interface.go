@@ -71,6 +71,9 @@ type HostDriver interface {
 	// TransferHDD 移交数据盘
 	TransferHDD(vmUUID string, hdd *model.SDConfig, targetVM string) (*model.ZMessage, error)
 
+	// HDDCheck 数据盘移交前置校验（源/目标存在、磁盘存在且已卸载）
+	HDDCheck(vmUUID string, hdd *model.SDConfig, targetVM string) (*model.ZMessage, error)
+
 	// MountISO 挂载/卸载ISO
 	MountISO(vmUUID string, iso *model.IMConfig, mount bool) (*model.ZMessage, error)
 
@@ -92,8 +95,20 @@ type HostDriver interface {
 	// SetPassword 设置虚拟机密码
 	SetPassword(vmUUID string, password string) (*model.ZMessage, error)
 
-	// GetVMSaving 获取内存中的虚拟机配置map
+	// GetVMSaving 获取内存中的虚拟机配置快照（深复制，可安全在锁外读写）
 	GetVMSaving() map[string]*model.VMConfig
+
+	// SetVMPowerState 在锁内更新虚拟机电源状态（供调度器采集使用）
+	SetVMPowerState(vmUUID string, state model.VMPowers) bool
+
+	// SetVMDeleted 在锁内更新扫描软删除标记（供扫描流程使用）
+	SetVMDeleted(vmUUID string, deleted bool) bool
+
+	// RemoveVMSaving 在锁内移除一条虚拟机内存记录（仅本机记录，不动平台）
+	RemoveVMSaving(vmUUID string) bool
+
+	// UpsertVMSaving 在锁内写入/替换单条虚拟机内存记录
+	UpsertVMSaving(vmUUID string, cfg *model.VMConfig)
 
 	// SetVMSaving 设置虚拟机配置（用于从数据库恢复）
 	SetVMSaving(vms map[string]*model.VMConfig)
@@ -105,13 +120,28 @@ type HostDriver interface {
 	Crontab() bool
 }
 
-// NewDriver 根据主机类型创建对应驱动
+// NewDriver 根据主机类型创建对应驱动，并回填最外层实例引用
 func NewDriver(cfg *model.HSConfig) HostDriver {
+	d := createDriver(cfg)
+	if d == nil {
+		return nil
+	}
+	// 记录最外层实例，供基类通用实现派发到平台覆盖的方法（模拟 Python 虚方法）
+	if s, ok := d.(interface{ SetSelf(HostDriver) }); ok {
+		s.SetSelf(d)
+	}
+	return d
+}
+
+// createDriver 具体驱动构造分发
+func createDriver(cfg *model.HSConfig) HostDriver {
 	switch cfg.ServerType {
 	case "PromoxSetup":
 		return NewProxmoxDriver(cfg)
 	case "vSphereESXi":
-		return NewVSphereDriver(cfg)
+		// 使用基于 govmomi 的完整 ESXi/vSphere 驱动（支持创建/删除/电源/快照/VNC 等）
+		// VSphereDriver（platform_drivers.go 中的 HTTP REST 精简版）仅保留作为无 govmomi 环境参考
+		return NewESXiDriver(cfg)
 	case "LxContainer":
 		return NewLXDDriver(cfg)
 	case "OCInterface":

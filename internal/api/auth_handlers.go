@@ -4,16 +4,42 @@ package api
 import (
 	"encoding/json"
 	"fmt"
+	"net/url"
 	"regexp"
+	"strconv"
 	"strings"
+	"time"
 
 	"github.com/gin-contrib/sessions"
 	"github.com/gin-gonic/gin"
 
 	"github.com/OpenIDCSTeam/HostAgent-Go/internal/auth"
+	"github.com/OpenIDCSTeam/HostAgent-Go/internal/logger"
 	"github.com/OpenIDCSTeam/HostAgent-Go/internal/model"
 	"github.com/OpenIDCSTeam/HostAgent-Go/pkg/utils"
 )
+
+// passwordResetTTL 密码重置令牌有效期
+const passwordResetTTL = time.Hour
+
+// encodeResetToken 生成带有效期的重置令牌：<过期时间戳>.<随机串>。
+// 直接把过期时间编入令牌，避免为此新增数据库字段。
+func encodeResetToken(rawToken string) string {
+	return fmt.Sprintf("%d.%s", time.Now().Add(passwordResetTTL).Unix(), rawToken)
+}
+
+// parseResetToken 解析重置令牌并校验基本格式。
+func parseResetToken(token string) (int64, bool) {
+	parts := strings.SplitN(strings.TrimSpace(token), ".", 2)
+	if len(parts) != 2 || len(parts[1]) < 32 {
+		return 0, false
+	}
+	expiresAt, err := strconv.ParseInt(parts[0], 10, 64)
+	if err != nil || expiresAt <= 0 {
+		return 0, false
+	}
+	return expiresAt, true
+}
 
 // handleLogin POST /api/login
 func (app *App) handleLogin(c *gin.Context) {
@@ -30,9 +56,18 @@ func (app *App) handleLogin(c *gin.Context) {
 		Token     string `json:"token"`
 		Username  string `json:"username"`
 		Password  string `json:"password"`
+		// AccessKey 虚拟机访问密钥（16 位字母数字）
+		AccessKey string `json:"access_key"`
 	}
 	if err := c.ShouldBindJSON(&req); err != nil {
 		utils.BadRequest(c, "请求参数错误")
+		return
+	}
+
+	// 访问密钥登录：凭据直接绑定虚拟机，登录后进入该虚拟机的管理页面。
+	// 会话形态与临时凭据（temptoken）一致 —— 同一虚拟用户、同一权限掩码。
+	if req.LoginType == "access_key" || req.LoginType == "accesskey" || req.LoginType == "key" {
+		app.handleAccessKeyLogin(c, ip, strings.TrimSpace(req.AccessKey))
 		return
 	}
 
@@ -44,6 +79,10 @@ func (app *App) handleLogin(c *gin.Context) {
 		sysToken := app.SystemSvc.GetToken()
 		if req.Token == "" || req.Token != sysToken {
 			auth.RecordLoginFailure(ip)
+			app.Logger.Event("auth", "用户登录").IP(ip).
+				Detail("login_type", "token").
+				Detail("reason", "invalid_token").
+				Warn("Token 登录失败：凭据无效")
 			utils.Fail(c, 401, "Token无效")
 			return
 		}
@@ -61,11 +100,19 @@ func (app *App) handleLogin(c *gin.Context) {
 		user, err := app.DB.GetUserByUsername(req.Username)
 		if err != nil || user == nil {
 			auth.RecordLoginFailure(ip)
+			app.Logger.Event("auth", "用户登录").User(req.Username).IP(ip).
+				Detail("login_type", "password").
+				Detail("reason", "user_not_found").
+				Warn("登录失败：用户名或密码错误")
 			utils.Fail(c, 401, "用户名或密码错误")
 			return
 		}
 		// 检查账号是否启用
 		if !model.SafeGetBool(user, "is_active") {
+			app.Logger.Event("auth", "用户登录").User(req.Username).IP(ip).
+				Detail("login_type", "password").
+				Detail("reason", "account_disabled").
+				Warn("登录失败：账号已被禁用")
 			utils.Fail(c, 401, "账号已被禁用")
 			return
 		}
@@ -73,6 +120,10 @@ func (app *App) handleLogin(c *gin.Context) {
 		settings, _ := app.SystemSvc.GetSettings()
 		if settings["email_verification_enabled"] == "1" {
 			if !model.SafeGetBool(user, "email_verified") {
+				app.Logger.Event("auth", "用户登录").User(req.Username).IP(ip).
+					Detail("login_type", "password").
+					Detail("reason", "email_unverified").
+					Warn("登录失败：邮箱未验证")
 				utils.Fail(c, 403, "请先验证邮箱后再登录")
 				return
 			}
@@ -81,6 +132,10 @@ func (app *App) handleLogin(c *gin.Context) {
 		password := model.SafeGetString(user, "password")
 		if !auth.CheckPassword(req.Password, password) {
 			auth.RecordLoginFailure(ip)
+			app.Logger.Event("auth", "用户登录").User(req.Username).IP(ip).
+				Detail("login_type", "password").
+				Detail("reason", "invalid_credential").
+				Warn("登录失败：用户名或密码错误")
 			utils.Fail(c, 401, "用户名或密码错误")
 			return
 		}
@@ -96,10 +151,29 @@ func (app *App) handleLogin(c *gin.Context) {
 	session := sessions.Default(c)
 	username := model.SafeGetString(userInfo, "username")
 	session.Set(auth.SessionKeyUser, username)
+	if isTokenLogin {
+		// Token 登录没有对应用户口令，单独打标；
+		// 若按口令标记校验，该会话会在下一次请求被判为失效。
+		session.Set(auth.SessionKeyTokenLogin, true)
+	} else {
+		// 记录口令标记，口令变更后该会话自动失效
+		session.Set(auth.SessionKeyPasswordTag, auth.PasswordTag(model.SafeGetString(userInfo, "password")))
+	}
 	if err := session.Save(); err != nil {
+		app.Logger.Event("auth", "用户登录").User(username).IP(ip).Err(err).
+			Errorf("登录会话保存失败：%v", err)
 		utils.InternalError(c, "Session保存失败，请重试")
 		return
 	}
+
+	loginType := "password"
+	if isTokenLogin {
+		loginType = "token"
+	}
+	app.Logger.Event("auth", "用户登录").User(username).IP(ip).
+		Detail("login_type", loginType).
+		Detail("is_admin", isAdminUser(userInfo)).
+		Info("用户 %s 登录成功", username)
 
 	// 构建重定向路径
 	redirect := "/dashboard"
@@ -125,9 +199,11 @@ func (app *App) handleLogin(c *gin.Context) {
 
 // handleLogout POST /api/logout
 func (app *App) handleLogout(c *gin.Context) {
+	username := currentUsername(c)
 	session := sessions.Default(c)
 	session.Clear()
 	_ = session.Save()
+	app.logEvent(c, "auth", "用户登出").User(username).Info("用户 %s 已退出登录", username)
 	utils.SuccessMsg(c, "已退出登录", nil)
 }
 
@@ -274,11 +350,18 @@ func (app *App) handleForgotPassword(c *gin.Context) {
 	user, _ := app.DB.GetUserByEmail(req.Email)
 	// 无论用户是否存在，都返回成功（防止邮箱枚举）
 	if user != nil {
-		resetToken, _ := auth.GenerateToken()
+		rawToken, tokenErr := auth.GenerateToken()
+		if tokenErr != nil {
+			utils.SuccessMsg(c, "如果邮箱存在，重置链接已发送", nil)
+			return
+		}
+		resetToken := encodeResetToken(rawToken)
 		id, _ := user["id"].(int)
-		_ = app.DB.UpdateUser(id, map[string]interface{}{
+		if err := app.DB.UpdateUser(id, map[string]interface{}{
 			"reset_token": resetToken,
-		})
+		}); err != nil {
+			app.Logger.Log("auth", "ERROR", "密码重置", fmt.Sprintf("保存重置令牌失败: %v", err), false)
+		}
 		go func() {
 			emailSvc := app.SystemSvc.GetEmailService()
 			if emailSvc != nil {
@@ -287,7 +370,7 @@ func (app *App) handleForgotPassword(c *gin.Context) {
 				if baseURL == "" {
 					baseURL = "http://localhost:1880"
 				}
-				resetLink := fmt.Sprintf("%s/reset-password?token=%s", baseURL, resetToken)
+				resetLink := fmt.Sprintf("%s/reset-password?token=%s", baseURL, url.QueryEscape(resetToken))
 				username := model.SafeGetString(user, "username")
 				_ = emailSvc.SendPasswordResetEmail(req.Email, username, resetLink)
 			}
@@ -311,12 +394,26 @@ func (app *App) handleResetPassword(c *gin.Context) {
 		utils.BadRequest(c, "两次密码不一致")
 		return
 	}
-	if len(req.NewPassword) < 6 {
-		utils.BadRequest(c, "密码长度不能少于6字符")
+	if len(req.NewPassword) < 8 {
+		utils.BadRequest(c, "密码长度不能少于8字符")
 		return
 	}
 
-	user, err := app.DB.GetUserByResetToken(req.Token)
+	// 令牌必须非空且格式、有效期均合法。
+	// 历史实现直接以「空令牌」查询数据库，而该字段默认值为空字符串，
+	// 未登录者可用空令牌匹配到用户并重置其密码。
+	token := strings.TrimSpace(req.Token)
+	expiresAt, ok := parseResetToken(token)
+	if !ok {
+		utils.BadRequest(c, "重置Token无效或已过期")
+		return
+	}
+	if time.Now().Unix() > expiresAt {
+		utils.BadRequest(c, "重置Token已过期，请重新申请")
+		return
+	}
+
+	user, err := app.DB.GetUserByResetToken(token)
 	if err != nil || user == nil {
 		utils.BadRequest(c, "重置Token无效或已过期")
 		return
@@ -328,10 +425,14 @@ func (app *App) handleResetPassword(c *gin.Context) {
 		return
 	}
 	id := model.SafeGetInt(user, "id")
-	_ = app.DB.UpdateUser(id, map[string]interface{}{
+	if err := app.DB.UpdateUser(id, map[string]interface{}{
 		"password":    hashedPwd,
 		"reset_token": "",
-	})
+	}); err != nil {
+		utils.InternalError(c, "密码重置失败")
+		return
+	}
+	app.Logger.Log("auth", "INFO", "密码重置", fmt.Sprintf("用户 %s 通过邮箱令牌重置密码", model.SafeGetString(user, "username")), true)
 	utils.SuccessMsg(c, "密码重置成功", nil)
 }
 
@@ -343,6 +444,7 @@ func (app *App) handleChangePassword(c *gin.Context) {
 		return
 	}
 	var req struct {
+		CurrentPassword string `json:"current_password"`
 		NewPassword     string `json:"new_password"`
 		ConfirmPassword string `json:"confirm_password"`
 	}
@@ -354,8 +456,12 @@ func (app *App) handleChangePassword(c *gin.Context) {
 		utils.BadRequest(c, "两次密码不一致")
 		return
 	}
-	if len(req.NewPassword) < 6 {
-		utils.BadRequest(c, "密码长度不能少于6字符")
+	if len(req.NewPassword) < 8 {
+		utils.BadRequest(c, "密码长度不能少于8字符")
+		return
+	}
+	if req.CurrentPassword == "" {
+		utils.BadRequest(c, "请输入当前密码")
 		return
 	}
 
@@ -364,9 +470,31 @@ func (app *App) handleChangePassword(c *gin.Context) {
 		utils.NotFound(c, "用户不存在")
 		return
 	}
-	hashedPwd, _ := auth.HashPassword(req.NewPassword)
+	// 改密属于高敏感操作：必须验证当前口令，
+	// 否则仅凭被劫持的会话即可永久接管账号。
+	if !auth.CheckPassword(req.CurrentPassword, model.SafeGetString(user, "password")) {
+		app.Logger.Log("auth", "WARNING", "密码修改", fmt.Sprintf("用户 %s 当前密码校验失败", uc.Username), false)
+		utils.Fail(c, 401, "当前密码不正确")
+		return
+	}
+	hashedPwd, err := auth.HashPassword(req.NewPassword)
+	if err != nil {
+		utils.InternalError(c, "密码处理失败")
+		return
+	}
 	id := model.SafeGetInt(user, "id")
-	_ = app.DB.UpdateUser(id, map[string]interface{}{"password": hashedPwd})
+	if err := app.DB.UpdateUser(id, map[string]interface{}{"password": hashedPwd}); err != nil {
+		utils.InternalError(c, "密码修改失败")
+		return
+	}
+
+	// 口令变更后旧会话标记失效，需要刷新当前会话的标记，
+	// 使本次操作者保持登录，而其它设备上的旧会话被撤销。
+	session := sessions.Default(c)
+	session.Set(auth.SessionKeyPasswordTag, auth.PasswordTag(hashedPwd))
+	_ = session.Save()
+
+	app.Logger.Log("auth", "INFO", "密码修改", fmt.Sprintf("用户 %s 修改密码成功", uc.Username), true)
 	utils.SuccessMsg(c, "密码修改成功", nil)
 }
 
@@ -424,6 +552,40 @@ func (app *App) handleChangeEmail(c *gin.Context) {
 // 用户管理 API
 // ============================================================
 
+// adminTokenUserInfo 构造 Token 登录的管理员信息。
+//
+// 与 Python 版 build_admin_token_response 一致：Token 登录不对应真实用户，
+// 直接返回合成的管理员信息（配额取上限值），否则前端在 Token 登录模式下
+// 拿不到用户信息，页面会整体不可用。
+func adminTokenUserInfo() map[string]interface{} {
+	const maxQuota = 999999
+
+	info := map[string]interface{}{
+		"id":             0,
+		"username":       "admin",
+		"email":          "",
+		"is_admin":       true,
+		"is_active":      true,
+		"is_token_login": true,
+		"assigned_hosts": []string{},
+	}
+	for _, key := range []string{
+		"quota_cpu", "quota_ram", "quota_ssd", "quota_gpu",
+		"quota_nat_ports", "quota_web_proxy", "quota_nat_ips", "quota_pub_ips",
+		"quota_bandwidth_up", "quota_bandwidth_down", "quota_traffic",
+	} {
+		info[key] = maxQuota
+	}
+	for _, key := range []string{
+		"used_cpu", "used_ram", "used_ssd", "used_gpu",
+		"used_nat_ports", "used_web_proxy", "used_nat_ips", "used_pub_ips",
+		"used_bandwidth_up", "used_bandwidth_down", "used_traffic",
+	} {
+		info[key] = 0
+	}
+	return info
+}
+
 // handleUserCurrent GET /api/users/current
 func (app *App) handleUserCurrent(c *gin.Context) {
 	uc := auth.GetUserContext(c)
@@ -431,8 +593,20 @@ func (app *App) handleUserCurrent(c *gin.Context) {
 		utils.Unauthorized(c)
 		return
 	}
+	// 受限身份（临时凭据 / 访问密钥登录）不对应数据库用户，
+	// 直接返回受限用户信息，否则前端刷新页面时会因「用户不存在」而整体不可用。
+	if uc.TempLogin {
+		utils.Success(c, tempLoginUserInfo(uc.Username, uc.TempHsName, uc.TempVMUUID))
+		return
+	}
 	user, err := app.DB.GetUserByUsername(uc.Username)
 	if err != nil || user == nil {
+		// Token 登录（或管理员账号被重命名）时回退到合成信息，
+		// 避免前端因拿不到当前用户而整体不可用。
+		if uc.IsToken {
+			utils.Success(c, adminTokenUserInfo())
+			return
+		}
 		utils.NotFound(c, "用户不存在")
 		return
 	}
@@ -473,6 +647,9 @@ func (app *App) handleUserCreate(c *gin.Context) {
 	hashedPwd, _ := auth.HashPassword(password)
 	userID, err := app.DB.CreateUser(username, hashedPwd, email, isAdmin)
 	if err != nil {
+		app.logEvent(c, "user", "创建用户").
+			Detail("target_user", username).Detail("email", email).Detail("is_admin", isAdmin).Err(err).
+			Errorf("创建用户失败：%v", err)
 		utils.InternalError(c, "创建用户失败: "+err.Error())
 		return
 	}
@@ -489,6 +666,11 @@ func (app *App) handleUserCreate(c *gin.Context) {
 		_ = app.DB.UpdateUser(int(userID), defaultQuotas)
 	}
 
+	app.logEvent(c, "user", "创建用户").
+		Detail("target_user", username).
+		Detail("email", email).
+		Detail("is_admin", isAdmin).
+		Info("创建用户成功：%s（管理员=%v）", username, isAdmin)
 	utils.SuccessMsg(c, "用户创建成功", gin.H{"user_id": userID})
 }
 
@@ -521,16 +703,30 @@ func (app *App) handleUserUpdate(c *gin.Context) {
 	}
 
 	// 如果包含密码，先哈希
+	passwordChanged := false
 	if pwd, ok := req["password"].(string); ok && pwd != "" {
 		hashedPwd, _ := auth.HashPassword(pwd)
 		req["password"] = hashedPwd
+		passwordChanged = true
 	}
+
+	targetUser, _ := app.DB.GetUserByID(id)
+	targetName := model.SafeGetString(targetUser, "username")
 
 	updateFields := buildUserUpdateFields(req)
 	if err := app.DB.UpdateUser(id, updateFields); err != nil {
+		app.logEvent(c, "user", "更新用户").
+			Detail("target_user", targetName).Detail("user_id", id).Err(err).
+			Errorf("更新用户失败：%v", err)
 		utils.InternalError(c, "更新用户失败")
 		return
 	}
+	app.logEvent(c, "user", "更新用户").
+		Detail("target_user", targetName).
+		Detail("user_id", id).
+		Detail("changed_fields", sortedKeys(updateFields)).
+		Detail("password_changed", passwordChanged).
+		Info("更新用户成功：%s", targetName)
 	utils.SuccessMsg(c, "用户更新成功", nil)
 }
 
@@ -541,10 +737,20 @@ func (app *App) handleUserDelete(c *gin.Context) {
 		utils.BadRequest(c, "用户ID无效")
 		return
 	}
+	targetUser, _ := app.DB.GetUserByID(id)
+	targetName := model.SafeGetString(targetUser, "username")
+
 	if err := app.DB.DeleteUser(id); err != nil {
+		app.logEvent(c, "user", "删除用户").
+			Detail("target_user", targetName).Detail("user_id", id).Err(err).
+			Errorf("删除用户失败：%v", err)
 		utils.InternalError(c, "删除用户失败")
 		return
 	}
+	app.logEvent(c, "user", "删除用户").
+		Detail("target_user", targetName).
+		Detail("user_id", id).
+		Emit(logger.LevelWarn, "已删除用户：%s", targetName)
 	utils.SuccessMsg(c, "用户删除成功", nil)
 }
 

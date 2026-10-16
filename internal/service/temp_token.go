@@ -33,20 +33,32 @@ func NewTempTokenStore() *TempTokenStore {
 	return store
 }
 
+// TempTokenTTL 临时凭据有效期
+const TempTokenTTL = 5 * time.Minute
+
 // Generate 生成临时凭据（5分钟有效期）
 func (s *TempTokenStore) Generate(hsName, vmUUID, virtualUser string) string {
+	token, _ := s.GenerateWithExpire(hsName, vmUUID, virtualUser)
+	return token
+}
+
+// GenerateWithExpire 生成临时凭据并返回过期时间。
+// 外部插件（FSPlugins 等）需要 expire 字段用于自行判断凭据是否仍然有效，
+// 因此把过期时间显式返回给调用方，避免各处理器各自硬编码 300 秒。
+func (s *TempTokenStore) GenerateWithExpire(hsName, vmUUID, virtualUser string) (string, time.Time) {
 	token := s.generateToken(hsName, vmUUID, time.Now().Unix())
-	
+	expire := time.Now().Add(TempTokenTTL)
+
 	s.mu.Lock()
 	s.tokens[token] = tempTokenData{
 		HsName:      hsName,
 		VmUUID:      vmUUID,
 		VirtualUser: virtualUser,
-		Expire:      time.Now().Add(5 * time.Minute),
+		Expire:      expire,
 	}
 	s.mu.Unlock()
-	
-	return token
+
+	return token, expire
 }
 
 // Consume 消费临时凭据（一次性，消费后删除）

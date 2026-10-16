@@ -13,8 +13,10 @@ import (
 
 // VMCleanupService VM资源清理服务
 type VMCleanupService struct {
-	DB *data.DB
-	mu sync.Mutex // 防止并发清理同一VM
+	DB       *data.DB
+	natSvc   *NATService
+	proxySvc *ProxyService
+	mu       sync.Mutex // 防止并发清理同一VM
 }
 
 // NewVMCleanupService 创建VM清理服务
@@ -22,6 +24,16 @@ func NewVMCleanupService(db *data.DB) *VMCleanupService {
 	return &VMCleanupService{
 		DB: db,
 	}
+}
+
+// SetNATService 注入NAT下发服务（可选）
+func (s *VMCleanupService) SetNATService(svc *NATService) {
+	s.natSvc = svc
+}
+
+// SetProxyService 注入反向代理下发服务（可选）
+func (s *VMCleanupService) SetProxyService(svc *ProxyService) {
+	s.proxySvc = svc
 }
 
 // CleanupVMResources 清理VM关联的所有资源
@@ -94,63 +106,35 @@ func (s *VMCleanupService) CleanupVMResources(hsName, vmUUID string) error {
 	return nil
 }
 
-// deleteNATRule 删除NAT端口映射
-// TODO: 需要实现实际的iKuai路由器API调用
+// deleteNATRule 删除NAT端口映射（下发路由器 + 删库）
 func (s *VMCleanupService) deleteNATRule(hsName, vmUUID string, nat model.PortData) error {
-	// 获取主机配置
-	host, err := s.DB.GetHostByName(hsName)
-	if err != nil {
-		return fmt.Errorf("获取主机配置失败: %w", err)
+	if s.natSvc != nil {
+		if err := s.natSvc.RevokePortMap(hsName, vmUUID, nat); err != nil {
+			return fmt.Errorf("下发NAT删除失败: %w", err)
+		}
+		log.Printf("已下发删除NAT映射: %s:%d -> %d", nat.LanAddr, nat.LanPort, nat.WanPort)
+		return nil
 	}
 
-	if host == nil {
-		return fmt.Errorf("主机 %s 不存在", hsName)
-	}
-
-	// TODO: 调用iKuai路由器API删除NAT规则
-	// 示例: ikuai.DeletePortMap(host.NatHost, host.NatUser, host.NatPass, nat.WanPort)
-	
-	// 暂时只记录日志
-	natHost := ""
-	if v, ok := host["nat_host"]; ok {
-		natHost = fmt.Sprintf("%v", v)
-	}
-	log.Printf("准备删除NAT规则: 路由器=%s, 外网端口=%d, 内网地址=%s:%d",
-		natHost, nat.WanPort, nat.LanAddr, nat.LanPort)
-
-	// 从数据库删除NAT记录
+	// 未注入NAT服务时仅删除数据库记录
 	if err := s.DB.DeleteNATRule(hsName, vmUUID, nat.WanPort); err != nil {
 		return fmt.Errorf("从数据库删除NAT记录失败: %w", err)
 	}
-
 	return nil
 }
 
-// deleteWebProxy 删除Web反向代理
-// TODO: 需要实现实际的反向代理服务器API调用
+// deleteWebProxy 删除Web反向代理（删库 + 重载代理配置）
 func (s *VMCleanupService) deleteWebProxy(hsName, vmUUID string, proxy *model.WebProxy) error {
-	// 获取主机配置
-	host, err := s.DB.GetHostByName(hsName)
-	if err != nil {
-		return fmt.Errorf("获取主机配置失败: %w", err)
-	}
-
-	if host == nil {
-		return fmt.Errorf("主机 %s 不存在", hsName)
-	}
-
-	// TODO: 调用反向代理服务器API删除代理规则
-	// 示例: nginx.DeleteProxy(proxy.WebAddr)
-	
-	// 暂时只记录日志
-	log.Printf("准备删除Web代理: 域名=%s, 后端=%s:%d",
-		proxy.WebAddr, proxy.LanAddr, proxy.LanPort)
-
-	// 从数据库删除Web代理记录
 	if err := s.DB.DeleteWebProxy(hsName, vmUUID, proxy.WebAddr); err != nil {
 		return fmt.Errorf("从数据库删除Web代理记录失败: %w", err)
 	}
 
+	if s.proxySvc != nil {
+		if err := s.proxySvc.ApplyProxy(hsName, vmUUID, *proxy, false); err != nil {
+			return fmt.Errorf("下发反向代理删除失败: %w", err)
+		}
+		log.Printf("已删除Web代理并下发: %s -> %s:%d", proxy.WebAddr, proxy.LanAddr, proxy.LanPort)
+	}
 	return nil
 }
 
@@ -167,23 +151,23 @@ func (s *VMCleanupService) CleanupOrphanedResources() (int, error) {
 
 	for _, host := range hosts {
 		// 获取该主机的所有VM
-		vms, err := s.DB.GetVMsByHost(host.ServerName)
+		vms, err := s.DB.GetVMsByHost(host.HsName)
 		if err != nil {
-			log.Printf("获取主机 %s 的VM列表失败: %v", host.ServerName, err)
+			log.Printf("获取主机 %s 的VM列表失败: %v", host.HsName, err)
 			continue
 		}
 
 		vmUUIDs := make(map[string]bool)
 		for _, vmMap := range vms {
-			if vmUUID, ok := vmMap["vm_uuid"].(string); ok {
+			if vmUUID, ok := vmMap["vm_uuid"].(string); ok && vmUUID != "" {
 				vmUUIDs[vmUUID] = true
 			}
 		}
 
 		// 检查NAT规则
-		natRules, err := s.DB.GetNATRulesByHost(host.ServerName)
+		natRules, err := s.DB.GetNATRulesByHost(host.HsName)
 		if err != nil {
-			log.Printf("获取主机 %s 的NAT规则失败: %v", host.ServerName, err)
+			log.Printf("获取主机 %s 的NAT规则失败: %v", host.HsName, err)
 			continue
 		}
 
@@ -192,7 +176,7 @@ func (s *VMCleanupService) CleanupOrphanedResources() (int, error) {
 			wanPort, _ := natMap["wan_port"].(int)
 			if !vmUUIDs[vmUUID] {
 				log.Printf("发现孤立NAT规则: VM=%s, 端口=%d", vmUUID, wanPort)
-				if err := s.DB.DeleteNATRule(host.ServerName, vmUUID, wanPort); err != nil {
+				if err := s.DB.DeleteNATRule(host.HsName, vmUUID, wanPort); err != nil {
 					log.Printf("删除孤立NAT规则失败: %v", err)
 				} else {
 					cleanedCount++
@@ -201,9 +185,9 @@ func (s *VMCleanupService) CleanupOrphanedResources() (int, error) {
 		}
 
 		// 检查Web代理
-		webProxies, err := s.DB.GetWebProxiesByHost(host.ServerName)
+		webProxies, err := s.DB.GetWebProxiesByHost(host.HsName)
 		if err != nil {
-			log.Printf("获取主机 %s 的Web代理失败: %v", host.ServerName, err)
+			log.Printf("获取主机 %s 的Web代理失败: %v", host.HsName, err)
 			continue
 		}
 
@@ -213,7 +197,7 @@ func (s *VMCleanupService) CleanupOrphanedResources() (int, error) {
 			webName, _ := proxyMap["web_name"].(string)
 			if !vmUUIDs[vmUUID] {
 				log.Printf("发现孤立Web代理: VM=%s, 域名=%s", vmUUID, webDomain)
-				if err := s.DB.DeleteWebProxy(host.ServerName, vmUUID, webName); err != nil {
+				if err := s.DB.DeleteWebProxy(host.HsName, vmUUID, webName); err != nil {
 					log.Printf("删除孤立Web代理失败: %v", err)
 				} else {
 					cleanedCount++

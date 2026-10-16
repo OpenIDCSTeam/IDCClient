@@ -1,15 +1,33 @@
 <!doctype html>
-<html lang="zh-CN">
+<html lang="zh-CN" data-theme="light">
   <head>
     <meta charset="UTF-8" />
     <link rel="icon" type="image/svg+xml" href="/vite.svg" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <meta name="theme-color" content="#f4f6fb" media="(prefers-color-scheme: light)" />
+    <meta name="theme-color" content="#0c0e14" media="(prefers-color-scheme: dark)" />
     <title>OpenIDCS 虚拟化管理平台</title>
-    <script type="module" crossorigin src="/assets/index-DZHok5Kk.js"></script>
-    <link rel="modulepreload" crossorigin href="/assets/antd-vendor-Di9nFkyN.js">
-    <link rel="modulepreload" crossorigin href="/assets/react-vendor-BopL7hYs.js">
-    <link rel="modulepreload" crossorigin href="/assets/chart-vendor-CbjmbVVY.js">
-    <link rel="stylesheet" crossorigin href="/assets/index-DKLsuV4a.css">
+    <script>
+      /* 在首屏样式计算前恢复主题与显示开关，避免刷新时闪白 / 闪黑（FOUC）。
+         与 src/contexts/ThemeContext.tsx 中读取的 localStorage 键名保持一致。 */
+      (function () {
+        try {
+          var root = document.documentElement;
+          root.setAttribute('data-theme', localStorage.getItem('theme') || 'light');
+          if (localStorage.getItem('transparentMode') === 'true') root.setAttribute('data-transparent', 'true');
+          if (localStorage.getItem('roundedMode') === 'true') root.setAttribute('data-rounded', 'true');
+          if (localStorage.getItem('liquidMode') === 'true') root.setAttribute('data-liquid', 'true');
+          if (localStorage.getItem('animeBlurMode') === 'true') root.setAttribute('data-anime-blur', 'true');
+        } catch (e) {
+          /* localStorage 不可用时静默降级为默认主题 */
+        }
+      })();
+    </script>
+    <script type="module" crossorigin src="/assets/index-7tOwaH-s.js"></script>
+    <link rel="modulepreload" crossorigin href="/assets/antd-vendor-D7yzaKwx.js">
+    <link rel="modulepreload" crossorigin href="/assets/react-vendor-Boc_KaPq.js">
+    <link rel="modulepreload" crossorigin href="/assets/chart-vendor-DzxyFAi9.js">
+    <link rel="stylesheet" crossorigin href="/assets/index-m5Vcf8fV.css">
   </head>
   <body>
     <!-- React应用挂载点 -->

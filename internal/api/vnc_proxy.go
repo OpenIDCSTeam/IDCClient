@@ -4,18 +4,30 @@
 package api
 
 import (
+	"context"
+	"crypto/rand"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"log"
 	"net"
 	"net/http"
+	"net/url"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
 
 	"github.com/gorilla/websocket"
 	"golang.org/x/crypto/ssh"
+
+	"github.com/OpenIDCSTeam/HostAgent-Go/internal/security"
 )
+
+// vncProxyPort VNC 代理（websockify）监听端口。
+// 与 cmd/server/main.go 中 NewVNCProxyServer(6080) 保持一致。
+const vncProxyPort = 6080
 
 // VNCToken VNC访问Token
 type VNCToken struct {
@@ -25,6 +37,23 @@ type VNCToken struct {
 	Port     int
 	ClientIP string
 	ExpireAt time.Time
+}
+
+// registerVNCBridgeToken 生成并注册一个 VNC 桥接 token，返回 token 字符串。
+//
+// ClientIP 留空表示不绑定来源 IP：控制台地址由后端拼装后交给浏览器，
+// 浏览器再连 6080，此时来源 IP 与 API 请求 IP 一致，但若中间有 NAT/代理
+// 则可能不同，绑定 IP 会造成偶发 401。VNC 端口本身不对外暴露时风险可控。
+func registerVNCBridgeToken(hsName, vmUUID, host string, port int) string {
+	buf := make([]byte, 16)
+	if _, err := rand.Read(buf); err != nil {
+		// 随机源不可用时退化为时间戳派生的值，仍保证唯一性
+		sum := sha256.Sum256([]byte(fmt.Sprintf("%s:%s:%d", hsName, vmUUID, time.Now().UnixNano())))
+		buf = sum[:16]
+	}
+	token := hex.EncodeToString(buf)
+	RegisterVNCToken(token, hsName, vmUUID, host, "", port)
+	return token
 }
 
 var (
@@ -70,14 +99,56 @@ func GetVNCToken(token string, clientIP string) *VNCToken {
 type VNCProxyServer struct {
 	port     int
 	upgrader websocket.Upgrader
+	srv      *http.Server
+	mu       sync.Mutex
 }
 
-// allowedOrigins VNC允许的Origin白名单
+// allowedOrigins VNC允许的Origin白名单。
+//
+// 必须覆盖前端实际使用的所有端口：Vite 开发端口为 5171
+// （见 FrontPage/vite.config.ts），后端 1881；5183/5173 为历史端口，
+// 保留以免影响已在用的本地环境。
+//
+// 说明：白名单过窄会导致 WebSocket 握手被 403 拒绝，
+// 表现为「控制台打不开 / 终端连不上」，且只在浏览器控制台可见。
 var allowedOrigins = map[string]bool{
-	"http://localhost:1881":  true,
-	"http://localhost:5173":  true,
-	"http://127.0.0.1:1881":  true,
-	"http://127.0.0.1:5173":  true,
+	"http://localhost:1881": true,
+	"http://localhost:5171": true,
+	"http://localhost:5173": true,
+	"http://localhost:5183": true,
+	"http://127.0.0.1:1881": true,
+	"http://127.0.0.1:5171": true,
+	"http://127.0.0.1:5173": true,
+	"http://127.0.0.1:5183": true,
+}
+
+// checkWSOrigin 校验 WebSocket 升级请求的 Origin。
+//
+// 生产部署下前端与后端同源（同一端口由 Gin 托管静态资源），
+// 此时 Origin 形如 http://<host>[:port]，不属于 localhost 白名单，
+// 若直接按白名单拒绝会导致线上 VNC/SSH 终端全部不可用。
+// 因此策略为：
+//  1. 无 Origin（同源非浏览器客户端、原生 WebSocket）：放行；
+//  2. localhost/127.0.0.1 白名单命中：放行（本地开发）；
+//  3. 其余情况：要求 Origin 的 host 与请求 Host 一致（同源），否则拒绝。
+func checkWSOrigin(r *http.Request) bool {
+	origin := r.Header.Get("Origin")
+	if origin == "" {
+		return true
+	}
+	if allowedOrigins[origin] {
+		return true
+	}
+	// 同源判定：比较 Origin 的 host 与请求的 Host
+	u, err := url.Parse(origin)
+	if err != nil || u.Host == "" {
+		return false
+	}
+	if u.Host == r.Host {
+		return true
+	}
+	log.Printf("[ws] 拒绝跨源连接 Origin=%s Host=%s", origin, r.Host)
+	return false
 }
 
 // NewVNCProxyServer 创建VNC代理服务器
@@ -85,17 +156,7 @@ func NewVNCProxyServer(port int) *VNCProxyServer {
 	return &VNCProxyServer{
 		port: port,
 		upgrader: websocket.Upgrader{
-			CheckOrigin: func(r *http.Request) bool {
-				origin := r.Header.Get("Origin")
-				if origin == "" {
-					return true
-				}
-				if allowedOrigins[origin] {
-					return true
-				}
-				log.Printf("[vnc-proxy] 拒绝Origin: %s", origin)
-				return false
-			},
+			CheckOrigin:     checkWSOrigin,
 			ReadBufferSize:  8192,
 			WriteBufferSize: 8192,
 		},
@@ -109,15 +170,33 @@ func (s *VNCProxyServer) Start() {
 	mux.Handle("/", http.FileServer(http.Dir("./VNCConsole")))
 
 	srv := &http.Server{
-		Addr:    fmt.Sprintf(":%d", s.port),
-		Handler: mux,
+		Addr:              fmt.Sprintf(":%d", s.port),
+		Handler:           mux,
+		ReadHeaderTimeout: 20 * time.Second,
 	}
+	s.mu.Lock()
+	s.srv = srv
+	s.mu.Unlock()
+
 	go func() {
 		log.Printf("[vnc-proxy] 启动VNC代理服务，端口: %d", s.port)
 		if err := srv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
 			log.Printf("[vnc-proxy] 启动失败: %v", err)
 		}
 	}()
+}
+
+// Stop 关闭VNC代理服务
+func (s *VNCProxyServer) Stop(ctx context.Context) {
+	s.mu.Lock()
+	srv := s.srv
+	s.mu.Unlock()
+	if srv == nil {
+		return
+	}
+	if err := srv.Shutdown(ctx); err != nil {
+		log.Printf("[vnc-proxy] 关闭失败: %v", err)
+	}
 }
 
 // handleWebsockify 处理WebSocket->TCP代理
@@ -146,8 +225,8 @@ func (s *VNCProxyServer) handleWebsockify(w http.ResponseWriter, r *http.Request
 		return nil
 	})
 
-	// 连接到VNC TCP服务
-	tcpAddr := fmt.Sprintf("%s:%d", vncToken.Host, vncToken.Port)
+	// 连接到VNC TCP服务（JoinHostPort 兼容 IPv6 地址）
+	tcpAddr := net.JoinHostPort(vncToken.Host, strconv.Itoa(vncToken.Port))
 	tcpConn, err := net.DialTimeout("tcp", tcpAddr, 10*time.Second)
 	if err != nil {
 		log.Printf("[vnc-proxy] 连接VNC服务失败 %s: %v", tcpAddr, err)
@@ -219,21 +298,45 @@ type SSHTerminalServer struct {
 	upgrader websocket.Upgrader
 	tokens   map[string]*SSHConnInfo
 	tokenMu  sync.RWMutex
+	srv      *http.Server
+	mu       sync.Mutex
+	// writeMu 保证同一连接只有一个协程写入：
+	// gorilla/websocket 不支持并发写，stdout 与 stderr 两个转发协程
+	// 同时写会触发连接状态错乱。
+	writeMu sync.Mutex
+	// hostKeys 已知主机密钥存储（未注入时不校验，并打印告警）
+	hostKeys *security.HostKeyStore
+}
+
+// SetHostKeyStore 注入已知主机密钥存储
+func (s *SSHTerminalServer) SetHostKeyStore(store *security.HostKeyStore) {
+	s.hostKeys = store
+}
+
+// hostKeyCallback 返回 SSH 主机密钥校验回调。
+//
+// 原实现无条件使用 InsecureIgnoreHostKey，无法识别中间人；
+// 现在按 OPENIDCS_SSH_HOSTKEY 策略校验（默认 tofu）。
+func (s *SSHTerminalServer) hostKeyCallback() ssh.HostKeyCallback {
+	policy := security.CurrentSSHHostKeyPolicy()
+	if policy == security.SSHHostKeyInsecure {
+		log.Printf("[ssh-terminal] 警告：SSH 主机密钥校验已禁用（OPENIDCS_SSH_HOSTKEY=insecure）")
+		return ssh.InsecureIgnoreHostKey()
+	}
+	if s.hostKeys == nil {
+		log.Printf("[ssh-terminal] 警告：未注入已知主机密钥存储，本次连接不校验主机密钥")
+		return ssh.InsecureIgnoreHostKey()
+	}
+	return s.hostKeys.Callback(policy)
 }
 
 // NewSSHTerminalServer 创建SSH终端服务
 func NewSSHTerminalServer(port int) *SSHTerminalServer {
 	s := &SSHTerminalServer{
-		port: port,
+		port:   port,
 		tokens: make(map[string]*SSHConnInfo),
 		upgrader: websocket.Upgrader{
-			CheckOrigin: func(r *http.Request) bool {
-				origin := r.Header.Get("Origin")
-				if origin == "" {
-					return true
-				}
-				return allowedOrigins[origin]
-			},
+			CheckOrigin:     checkWSOrigin,
 			ReadBufferSize:  4096,
 			WriteBufferSize: 4096,
 		},
@@ -272,15 +375,40 @@ func (s *SSHTerminalServer) Start() {
 	mux.HandleFunc("/ws", s.handleWS)
 
 	srv := &http.Server{
-		Addr:    fmt.Sprintf(":%d", s.port),
-		Handler: mux,
+		Addr:              fmt.Sprintf(":%d", s.port),
+		Handler:           mux,
+		ReadHeaderTimeout: 20 * time.Second,
 	}
+	s.mu.Lock()
+	s.srv = srv
+	s.mu.Unlock()
+
 	go func() {
 		log.Printf("[ssh-terminal] 启动SSH终端服务，端口: %d", s.port)
 		if err := srv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
 			log.Printf("[ssh-terminal] 启动失败: %v", err)
 		}
 	}()
+}
+
+// Stop 关闭SSH终端服务
+func (s *SSHTerminalServer) Stop(ctx context.Context) {
+	s.mu.Lock()
+	srv := s.srv
+	s.mu.Unlock()
+	if srv == nil {
+		return
+	}
+	if err := srv.Shutdown(ctx); err != nil {
+		log.Printf("[ssh-terminal] 关闭失败: %v", err)
+	}
+}
+
+// writeWS 串行化对同一WebSocket连接的写入
+func (s *SSHTerminalServer) writeWS(conn *websocket.Conn, messageType int, data []byte) error {
+	s.writeMu.Lock()
+	defer s.writeMu.Unlock()
+	return conn.WriteMessage(messageType, data)
 }
 
 // handleWS 处理WebSocket连接，代理SSH终端I/O
@@ -309,15 +437,15 @@ func (s *SSHTerminalServer) handleWS(w http.ResponseWriter, r *http.Request) {
 		Auth: []ssh.AuthMethod{
 			ssh.Password(connInfo.Password),
 		},
-		HostKeyCallback: ssh.InsecureIgnoreHostKey(),
+		HostKeyCallback: s.hostKeyCallback(),
 		Timeout:         15 * time.Second,
 	}
 
-	addr := fmt.Sprintf("%s:%d", connInfo.Host, connInfo.Port)
+	addr := net.JoinHostPort(connInfo.Host, strconv.Itoa(connInfo.Port))
 	sshClient, err := ssh.Dial("tcp", addr, sshConfig)
 	if err != nil {
 		log.Printf("[ssh-terminal] SSH连接失败 %s: %v", addr, err)
-		wsConn.WriteMessage(websocket.TextMessage,
+		_ = s.writeWS(wsConn, websocket.TextMessage,
 			[]byte(fmt.Sprintf("\r\n\x1b[31mSSH连接失败: %v\x1b[0m\r\n", err)))
 		return
 	}
@@ -385,7 +513,7 @@ func (s *SSHTerminalServer) handleWS(w http.ResponseWriter, r *http.Request) {
 			if err != nil {
 				return
 			}
-			if err := wsConn.WriteMessage(websocket.TextMessage, buf[:n]); err != nil {
+			if err := s.writeWS(wsConn, websocket.TextMessage, buf[:n]); err != nil {
 				return
 			}
 		}
@@ -400,7 +528,7 @@ func (s *SSHTerminalServer) handleWS(w http.ResponseWriter, r *http.Request) {
 			if err != nil {
 				return
 			}
-			if err := wsConn.WriteMessage(websocket.TextMessage, buf[:n]); err != nil {
+			if err := s.writeWS(wsConn, websocket.TextMessage, buf[:n]); err != nil {
 				return
 			}
 		}

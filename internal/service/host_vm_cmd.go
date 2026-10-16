@@ -3,10 +3,34 @@ package service
 
 import (
 	"encoding/json"
+	"fmt"
+	"strings"
 	"sync"
 
 	"github.com/OpenIDCSTeam/HostAgent-Go/internal/model"
 )
+
+// DecodeVMConfig 解析数据库中的虚拟机配置。
+//
+// 兼容历史上被双重编码的记录（配置被存为「JSON 字符串」而不是对象）：
+// 这类记录会让后续 json.Unmarshal 到 VMConfig 失败，从而静默跳过该虚拟机。
+func DecodeVMConfig(vmJSON string) (*model.VMConfig, error) {
+	if strings.TrimSpace(vmJSON) == "" {
+		return nil, fmt.Errorf("虚拟机配置不存在")
+	}
+	trimmed := strings.TrimSpace(vmJSON)
+	if strings.HasPrefix(trimmed, `"`) {
+		var inner string
+		if err := json.Unmarshal([]byte(trimmed), &inner); err == nil {
+			trimmed = inner
+		}
+	}
+	var vm model.VMConfig
+	if err := json.Unmarshal([]byte(trimmed), &vm); err != nil {
+		return nil, err
+	}
+	return &vm, nil
+}
 
 var (
 	cmdIndexMu sync.RWMutex
@@ -21,9 +45,14 @@ type vmLocation struct {
 
 // CheckVMOwnership 检查用户是否拥有虚拟机操作权限
 func (s *HostService) CheckVMOwnership(username, hsName, vmUUID string) bool {
+	// 空用户名必须拒绝：否则所有者表中一旦存在空键，
+	// 未认证身份会被判定为“拥有”该虚拟机。
+	if username == "" || hsName == "" || vmUUID == "" {
+		return false
+	}
 	// 检查虚拟机所有者列表
 	vmJSON, err := s.db.GetVMConfig(hsName, vmUUID)
-	if err != nil {
+	if err != nil || vmJSON == "" {
 		return false
 	}
 
@@ -42,10 +71,50 @@ func (s *HostService) CheckVMOwnership(username, hsName, vmUUID string) bool {
 	return false
 }
 
+// VMCount 返回主机下的虚拟机数量（优先驱动内存，其次数据库）
+func (s *HostService) VMCount(hsName string) int {
+	if d := s.getDriver(hsName); d != nil {
+		return len(d.GetVMSaving())
+	}
+	vms, err := s.db.GetVMSaving(hsName)
+	if err != nil {
+		return 0
+	}
+	return len(vms)
+}
+
+// MustGetVMConfig 读取虚拟机配置：优先驱动内存，其次数据库；
+// 不存在或无法解析时返回 nil。
+func (s *HostService) MustGetVMConfig(hsName, vmUUID string) *model.VMConfig {
+	if hsName == "" || vmUUID == "" {
+		return nil
+	}
+	if d := s.GetDriver(hsName); d != nil {
+		if cfg, err := d.GetVMDetail(vmUUID); err == nil {
+			return cfg
+		}
+	}
+	raw, err := s.db.GetVMConfig(hsName, vmUUID)
+	if err != nil || raw == "" {
+		return nil
+	}
+	cfg, err := DecodeVMConfig(raw)
+	if err != nil {
+		return nil
+	}
+	return cfg
+}
+
 // VMExists 检查虚拟机是否存在
+//
+// 注意：配置不存在时 GetVMConfig 返回 ("", nil)，
+// 因此必须同时判断非空与无错误，否则不存在的计算机会被判定为存在。
 func (s *HostService) VMExists(hsName, vmUUID string) bool {
-	_, err := s.db.GetVMConfig(hsName, vmUUID)
-	return err == nil
+	if hsName == "" || vmUUID == "" {
+		return false
+	}
+	vmJSON, err := s.db.GetVMConfig(hsName, vmUUID)
+	return err == nil && vmJSON != ""
 }
 
 // SetVMCmd 设置虚拟机待执行命令
@@ -55,17 +124,18 @@ func (s *HostService) SetVMCmd(hsName, vmUUID string, cmdData map[string]interfa
 		return err
 	}
 
-	var vm model.VMConfig
-	if err := json.Unmarshal([]byte(vmJSON), &vm); err != nil {
+	vm, err := DecodeVMConfig(vmJSON)
+	if err != nil {
 		return err
 	}
 
 	// 设置命令数据
 	vm.VmCmd = cmdData
 
-	// 保存到数据库
-	vmBytes, _ := json.Marshal(vm)
-	if err := s.db.UpsertVMConfig(hsName, vmUUID, string(vmBytes)); err != nil {
+	// 保存到数据库：直接传结构体，由仓储统一序列化一次。
+	// 此前先 Marshal 成 string 再传入，仓储会二次 Marshal，
+	// 结果是配置被存为「JSON 字符串」而非对象，后续无法解析。
+	if err := s.db.UpsertVMConfig(hsName, vmUUID, &vm); err != nil {
 		return err
 	}
 
@@ -86,9 +156,17 @@ func (s *HostService) SetVMCmdResult(hsName, vmUUID string, result map[string]in
 		return err
 	}
 
-	var vm model.VMConfig
-	if err := json.Unmarshal([]byte(vmJSON), &vm); err != nil {
+	vm, err := DecodeVMConfig(vmJSON)
+	if err != nil {
 		return err
+	}
+
+	// 仅当回传的 cmd_id 与当前待执行命令一致时才写入结果并清空命令，
+	// 避免迟到的旧回包覆盖或清除新下发的命令。
+	if cmdID, ok := result["cmd_id"].(string); ok && cmdID != "" {
+		if pending, ok := vm.VmCmd["cmd_id"].(string); ok && pending != "" && pending != cmdID {
+			return fmt.Errorf("命令回传与当前待执行命令不匹配: %s", cmdID)
+		}
 	}
 
 	// 设置结果数据
@@ -96,9 +174,8 @@ func (s *HostService) SetVMCmdResult(hsName, vmUUID string, result map[string]in
 	// 清除待执行命令
 	vm.VmCmd = nil
 
-	// 保存到数据库
-	vmBytes, _ := json.Marshal(vm)
-	if err := s.db.UpsertVMConfig(hsName, vmUUID, string(vmBytes)); err != nil {
+	// 保存到数据库：只序列化一次
+	if err := s.db.UpsertVMConfig(hsName, vmUUID, vm); err != nil {
 		return err
 	}
 
@@ -119,8 +196,8 @@ func (s *HostService) GetVMCmdStatus(hsName, vmUUID string) (pendingCmd, lastRes
 		return nil, nil, err
 	}
 
-	var vm model.VMConfig
-	if err := json.Unmarshal([]byte(vmJSON), &vm); err != nil {
+	vm, err := DecodeVMConfig(vmJSON)
+	if err != nil {
 		return nil, nil, err
 	}
 
@@ -141,84 +218,68 @@ func (s *HostService) FindVMByCmdID(cmdID string) (hsName, vmUUID string, found 
 }
 
 // SyncPushVM 同步推送虚拟机配置（智能合并）
+// 与 Python 版 api_sync_push / _sync_pull 的合并语义保持一致，实现见 vm_merge.go
 func (s *HostService) SyncPushVM(hsName string, remoteVMs map[string]map[string]interface{}) (int, error) {
-	updatedCount := 0
-
-	for vmUUID, remoteData := range remoteVMs {
-		// 获取本地虚拟机配置
-		localVMJSON, err := s.db.GetVMConfig(hsName, vmUUID)
-		if err != nil {
-			// 本地不存在，跳过（或根据业务需求创建新虚拟机）
-			continue
-		}
-
-		var localVM model.VMConfig
-		if err := json.Unmarshal([]byte(localVMJSON), &localVM); err != nil {
-			continue
-		}
-
-		// 智能合并配置（远端非空覆盖、本地非空保留）
-		merged := s.mergeVMConfig(&localVM, remoteData)
-
-		// 保存合并后的配置
-		mergedBytes, _ := json.Marshal(merged)
-		if err := s.db.UpsertVMConfig(hsName, vmUUID, string(mergedBytes)); err != nil {
-			continue
-		}
-
-		updatedCount++
-	}
-
-	return updatedCount, nil
+	return s.MergeRemoteVMs(hsName, remoteVMs)
 }
 
-// mergeVMConfig 智能合并虚拟机配置
-func (s *HostService) mergeVMConfig(local *model.VMConfig, remote map[string]interface{}) *model.VMConfig {
-	// 基础字段：远端非空则覆盖
-	if cpu, ok := remote["cpu"].(float64); ok && cpu > 0 {
-		local.CpuNum = int(cpu)
+// CheckHostAccess 检查用户是否有访问指定主机的权限。
+//
+// 管理员直接放行；普通用户必须存在、处于启用状态，
+// 且 assigned_hosts 中包含该主机。
+//
+// 该实现取代了此前恒返回 true 的占位逻辑：恒真实现会让
+// “已登录”等价于“可操作任意主机”，属于越权边界缺失。
+func (s *HostService) CheckHostAccess(username, hsName string) bool {
+	if username == "" || hsName == "" {
+		return false
 	}
-	if mem, ok := remote["mem"].(float64); ok && mem > 0 {
-		local.MemNum = int(mem)
+	user, err := s.db.GetUserByUsername(username)
+	if err != nil || user == nil {
+		return false
 	}
-	if hdd, ok := remote["hdd"].(float64); ok && hdd > 0 {
-		local.HddNum = int(hdd)
+	if model.SafeGetBool(user, "is_admin") {
+		return true
 	}
-	if os, ok := remote["os"].(string); ok && os != "" {
-		local.OsName = os
+	if !model.SafeGetBool(user, "is_active") {
+		return false
 	}
-	// status 字段映射到 VmFlag（需要转换为 VMPowers 类型）
-	if status, ok := remote["status"].(string); ok && status != "" {
-		// 仅在符合 VMPowers 枚举值时设置
-		local.VmFlag = model.VMPowers(status)
-	}
-	if ip, ok := remote["ip"].(string); ok && ip != "" {
-		// IP 地址存储在其他字段，这里简化处理
-		_ = ip
-	}
+	return containsHost(assignedHostsOf(user), hsName)
+}
 
-	// 所有者配置：按缺失补充
-	if ownAll, ok := remote["own_all"].(map[string]interface{}); ok && len(ownAll) > 0 {
-		if local.OwnAll == nil {
-			local.OwnAll = make(map[string]model.UserMask)
-		}
-		for username := range ownAll {
-			if _, exists := local.OwnAll[username]; !exists {
-				local.OwnAll[username] = model.UserMask{} // 默认权限
+// assignedHostsOf 兼容 []string、JSON 字符串与 []interface{} 三种存储形态。
+func assignedHostsOf(user map[string]interface{}) []string {
+	switch v := user["assigned_hosts"].(type) {
+	case []string:
+		return v
+	case []interface{}:
+		out := make([]string, 0, len(v))
+		for _, item := range v {
+			if s, ok := item.(string); ok {
+				out = append(out, s)
 			}
 		}
+		return out
+	case string:
+		if v == "" {
+			return nil
+		}
+		var out []string
+		if err := json.Unmarshal([]byte(v), &out); err != nil {
+			return nil
+		}
+		return out
+	default:
+		return nil
 	}
-
-	// NAT/端口转发、反向代理等配置类似处理（按缺失补充）
-	// 这里简化实现，实际需要根据数据结构解析
-
-	return local
 }
 
-// CheckHostAccess 检查用户是否有访问主机的权限（新方法，与原有方法区分）
-func (s *HostService) CheckHostAccess(username, hsName string) bool {
-	// 简化实现：假设从 session 中已获取用户权限
-	// 实际应该查询用户表获取 assigned_hosts
-	// 这里暂时返回 true，由上层 auth 中间件保证基本权限
-	return true
+// containsHost 判断切片中是否包含指定主机名。
+func containsHost(hosts []string, hsName string) bool {
+	for _, h := range hosts {
+		if h == hsName {
+			return true
+		}
+	}
+	return false
 }

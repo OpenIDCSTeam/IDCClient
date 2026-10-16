@@ -15,76 +15,14 @@ import (
 )
 
 // ============================================================
-// VMware vSphere/ESXi 驱动（通过 HTTP API）
-// ============================================================
-
-// VSphereDriver VMware vSphere/ESXi 驱动
-type VSphereDriver struct{ *BaseDriver }
-
-func NewVSphereDriver(cfg *model.HSConfig) *VSphereDriver {
-	return &VSphereDriver{BaseDriver: NewBaseDriver(cfg)}
-}
-
-func (d *VSphereDriver) GetPower(vmUUID string) string {
-	// 通过 vSphere REST API 获取 VM 电源状态
-	url := fmt.Sprintf("https://%s/rest/vcenter/vm/%s/power",
-		d.Config.ServerAddr, vmUUID)
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-	defer cancel()
-	req, err := http.NewRequestWithContext(ctx, "GET", url, nil)
-	if err != nil {
-		return "未知"
-	}
-	req.SetBasicAuth(d.Config.ServerUser, d.Config.ServerPass)
-	resp, err := http.DefaultClient.Do(req)
-	if err != nil {
-		return "未知"
-	}
-	defer resp.Body.Close()
-	var result struct {
-		Value struct {
-			State string `json:"state"`
-		} `json:"value"`
-	}
-	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
-		return "未知"
-	}
-	switch result.Value.State {
-	case "POWERED_ON":
-		return "运行中"
-	case "POWERED_OFF":
-		return "已关机"
-	case "SUSPENDED":
-		return "已暂停"
-	}
-	return "未知"
-}
-
-func (d *VSphereDriver) GetStatus() (*model.HWStatus, error) {
-	hw := &model.HWStatus{OnUpdate: time.Now().Unix()}
-	url := fmt.Sprintf("https://%s/rest/vcenter/host", d.Config.ServerAddr)
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-	defer cancel()
-	req, _ := http.NewRequestWithContext(ctx, "GET", url, nil)
-	req.SetBasicAuth(d.Config.ServerUser, d.Config.ServerPass)
-	resp, err := http.DefaultClient.Do(req)
-	if err != nil {
-		return hw, nil
-	}
-	defer resp.Body.Close()
-	var result struct {
-		Value []struct {
-			PowerState string `json:"power_state"`
-			Name       string `json:"name"`
-		} `json:"value"`
-	}
-	json.NewDecoder(resp.Body).Decode(&result)
-	return hw, nil
-}
-
-// ============================================================
 // LXC/LXD 驱动（通过 lxc 命令行）
 // ============================================================
+
+// 说明：vSphere/ESXi 引擎统一由 esxi_driver.go + esxi_ext.go 的 ESXiDriver 实现
+// （基于 govmomi SDK，覆盖创建/删除/电源/快照/直通/截图等完整能力）。
+// 历史上此处还有一个基于 vSphere REST 的 VSphereDriver 精简版，因从未被
+// createDriver 注册（属死代码），且与 ESXiDriver 构成「同一引擎两套实现」的
+// 隐患，已删除以免误用。
 
 // LXDDriver LXC/LXD 驱动
 type LXDDriver struct{ *BaseDriver }
@@ -112,14 +50,40 @@ func (d *LXDDriver) GetPower(vmUUID string) string {
 	return "未知"
 }
 
+// GetStatus 获取 LXD 主机状态。
+//
+// 与 Python 版 LXContainer.HSStatus 一致：优先解析 `lxc info` 的
+// CPU 核数与内存总量；原实现读取输出后直接丢弃，状态恒为空。
 func (d *LXDDriver) GetStatus() (*model.HWStatus, error) {
-	hw := &model.HWStatus{OnUpdate: time.Now().Unix()}
-	out, _, err := security.SafeExecWithTimeout(
-		[]string{"lxc", "storage", "info", "default"}, 10*time.Second)
-	if err != nil {
-		return hw, nil
+	// 远程 LXD：必须通过 SSH 采集对端宿主机状态（与 Python 版一致），
+	// 否则会把 IDCClient 本机资源误报为该主机状态。
+	if isRemoteTarget(d.Config) {
+		return d.remoteHWStatus(), nil
 	}
-	_ = out
+	hw := &model.HWStatus{OnUpdate: time.Now().Unix()}
+	out, _, err := security.SafeExecWithTimeout([]string{"lxc", "info"}, 15*time.Second)
+	if err != nil {
+		return localHWStatus(), nil
+	}
+
+	var inCPU, inMem bool
+	for _, line := range strings.Split(out, "\n") {
+		trimmed := strings.TrimSpace(line)
+		switch {
+		case strings.HasPrefix(trimmed, "cpu_total") || strings.Contains(trimmed, "cpu_total"):
+			inCPU = true
+			fmt.Sscanf(strings.TrimSpace(strings.TrimPrefix(trimmed, "cpu_total:")), "%d", &hw.CpuTotal)
+		case strings.HasPrefix(trimmed, "memory_total"):
+			inMem = true
+			var memBytes int64
+			fmt.Sscanf(strings.TrimSpace(strings.TrimPrefix(trimmed, "memory_total:")), "%d", &memBytes)
+			if memBytes > 0 {
+				hw.MemTotal = int(memBytes / 1024 / 1024)
+			}
+		}
+	}
+	_ = inCPU
+	_ = inMem
 	return hw, nil
 }
 
@@ -152,14 +116,39 @@ func (d *DockerDriver) GetPower(vmUUID string) string {
 	return "未知"
 }
 
+// GetStatus 获取 Docker 主机状态。
+//
+// 与 Python 版 OCInterface.HSStatus 一致：读取 docker info 的
+// NCPU / MemTotal / Containers 等真实字段。
+// 原实现把「运行中容器数」当成 CPU 核数写入 CpuTotal，属于字段错位。
 func (d *DockerDriver) GetStatus() (*model.HWStatus, error) {
-	hw := &model.HWStatus{OnUpdate: time.Now().Unix()}
-	out, _, err := security.SafeExecWithTimeout(
-		[]string{"docker", "info", "--format={{.ContainersRunning}}"}, 10*time.Second)
-	if err != nil {
-		return hw, nil
+	// 远程 Docker：通过 SSH 采集对端宿主机状态（与 Python 版一致），
+	// 否则会把 IDCClient 本机资源误报为该主机状态。
+	if isRemoteTarget(d.Config) {
+		return d.remoteHWStatus(), nil
 	}
-	fmt.Sscanf(strings.TrimSpace(out), "%d", &hw.CpuTotal)
+	hw := &model.HWStatus{OnUpdate: time.Now().Unix()}
+	out, _, err := security.SafeExecWithTimeout([]string{
+		"docker", "info", "--format",
+		"{{.NCPU}}|{{.MemTotal}}|{{.Containers}}|{{.ContainersRunning}}|{{.OperatingSystem}}",
+	}, 10*time.Second)
+	if err != nil {
+		// 本地 docker CLI 不可用时回退本机采集
+		return localHWStatus(), nil
+	}
+
+	parts := strings.Split(strings.TrimSpace(out), "|")
+	if len(parts) >= 2 {
+		fmt.Sscanf(strings.TrimSpace(parts[0]), "%d", &hw.CpuTotal)
+		var memBytes int64
+		fmt.Sscanf(strings.TrimSpace(parts[1]), "%d", &memBytes)
+		if memBytes > 0 {
+			hw.MemTotal = int(memBytes / 1024 / 1024)
+		}
+	}
+	if len(parts) >= 5 {
+		hw.CpuModel = strings.TrimSpace(parts[4])
+	}
 	return hw, nil
 }
 
@@ -282,6 +271,15 @@ func NewQEMUDriver(cfg *model.HSConfig) *QEMUDriver {
 	return &QEMUDriver{BaseDriver: NewBaseDriver(cfg)}
 }
 
+// GetStatus 获取 QEMU/KVM 主机状态。
+//
+// 与 Python 版 QEMUService.HSStatus 一致：server_addr 为本地时用本机采集，
+// 指向远程主机时通过 SSH 采集对端状态。
+// 原实现直接走基类的本机采集，远程 QEMU 主机会把 IDCClient 自身资源当作其状态。
+func (d *QEMUDriver) GetStatus() (*model.HWStatus, error) {
+	return d.BaseDriver.statusForPlatform()
+}
+
 func (d *QEMUDriver) GetPower(vmUUID string) string {
 	out, _, err := security.SafeExecWithTimeout(
 		[]string{"virsh", "domstate", vmUUID}, 10*time.Second)
@@ -324,14 +322,16 @@ func (d *QEMUDriver) PowerControl(vmUUID string, action model.VMPowers) (*model.
 	return d.BaseDriver.PowerControl(vmUUID, action)
 }
 
+// GetScreenshot 截取虚拟机屏幕。
+//
+// 与 Python 版 QEMUService.VMScreen 一致：virsh screenshot 输出 PPM，
+// 需转换后再返回。原实现写 --file /dev/stdout 会得到二进制 PPM 与命令输出混杂的
+// 无效字符串，前端根本无法显示。
 func (d *QEMUDriver) GetScreenshot(vmUUID string) (string, error) {
-	out, _, err := security.SafeExecWithTimeout(
-		[]string{"virsh", "screenshot", vmUUID, "--file", "/dev/stdout"},
-		10*time.Second)
-	if err != nil {
-		return "", err
+	if d.GetPower(vmUUID) != "运行中" {
+		return "", fmt.Errorf("虚拟机未运行，无法截图")
 	}
-	return out, nil
+	return d.captureQEMUScreenshot(vmUUID)
 }
 
 // ============================================================
@@ -459,26 +459,8 @@ func NewMemuDriver(cfg *model.HSConfig) *MemuDriver {
 	return &MemuDriver{BaseDriver: NewBaseDriver(cfg)}
 }
 
-func (d *MemuDriver) GetPower(vmUUID string) string {
-	out, _, err := security.SafeExecWithTimeout(
-		[]string{"memuc", "listvms"}, 10*time.Second)
-	if err != nil {
-		return "未知"
-	}
-	lines := strings.Split(out, "\n")
-	for _, line := range lines {
-		fields := strings.Fields(line)
-		if len(fields) >= 3 && fields[0] == vmUUID {
-			switch fields[2] {
-			case "运行中":
-				return "运行中"
-			case "已关闭":
-				return "已关机"
-			}
-		}
-	}
-	return "未知"
-}
+// 注：MEmu 的 GetPower 由 memu_lifecycle.go 实现（memuc isvmrunning），
+// 与 Python 版 MemuAndroid.GetPower 一致，此处不再重复定义。
 
 // ============================================================
 // 青州云 驱动（通过 HTTP API）

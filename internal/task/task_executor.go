@@ -108,11 +108,12 @@ func (e *Executor) executeJob(job *taskJob) {
 	// 执行任务
 	err := executor.Execute(ctx, task)
 
-	// 完成任务
+	// 完成任务：结果由 manager 在锁内读取，
+	// 避免执行器与状态写入并发读写同一 *Task
 	if err != nil {
-		e.manager.CompleteTask(task.ID, nil, err)
+		_ = e.manager.CompleteTask(task.ID, nil, err)
 	} else {
-		e.manager.CompleteTask(task.ID, task.Result, nil)
+		_ = e.manager.CompleteTask(task.ID, nil, nil)
 	}
 }
 

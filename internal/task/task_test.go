@@ -3,6 +3,7 @@ package task
 
 import (
 	"context"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -107,10 +108,12 @@ func TestTaskExecution(t *testing.T) {
 	}
 
 	// 创建模拟执行器
-	executed := false
+	// 使用原子变量标记执行状态：普通 bool 在工作协程写、测试协程读，
+	// 会被竞态检测判定为数据竞争。
+	var executed atomic.Bool
 	executor := &MockExecutor{
 		executeFunc: func(ctx context.Context, t *Task) error {
-			executed = true
+			executed.Store(true)
 			time.Sleep(100 * time.Millisecond)
 			t.Result["vm_uuid"] = "test-vm-001"
 			manager.UpdateProgress(t.ID, 50, "创建中")
@@ -132,7 +135,7 @@ func TestTaskExecution(t *testing.T) {
 	// 等待执行完成
 	time.Sleep(500 * time.Millisecond)
 
-	if !executed {
+	if !executed.Load() {
 		t.Error("任务未被执行")
 	}
 
@@ -211,14 +214,17 @@ func TestTaskCancellation(t *testing.T) {
 	// 等待取消生效和任务完成
 	time.Sleep(1 * time.Second)
 
-	// 验证任务状态（取消可能导致 cancelled 或 failed 状态）
+	// 验证任务状态：与 Python 版一致，用户终止后状态为 stopped
+	// （执行器先返回错误时也可能落到 failed）
 	cancelled, err := manager.GetTask(task.ID)
 	if err != nil {
 		t.Fatalf("获取任务失败: %v", err)
 	}
 
-	if cancelled.Status != TaskStatusCancelled && cancelled.Status != TaskStatusFailed {
-		t.Errorf("任务状态错误: 期望 'cancelled' 或 'failed', 实际 '%s'", cancelled.Status)
+	if cancelled.Status != TaskStatusStopped &&
+		cancelled.Status != TaskStatusCancelled &&
+		cancelled.Status != TaskStatusFailed {
+		t.Errorf("任务状态错误: 期望 'stopped'/'cancelled'/'failed', 实际 '%s'", cancelled.Status)
 	}
 }
 
@@ -335,7 +341,8 @@ func TestTaskStats(t *testing.T) {
 		t.Error("应该至少有一个 pending 或 completed 任务")
 	}
 
-	if stats["pending"]+stats["running"]+stats["completed"] != stats["total"] {
-		t.Error("任务统计数量不一致")
+	sum := stats["pending"] + stats["running"] + stats["completed"] + stats["failed"] + stats["stopped"]
+	if sum != stats["total"] {
+		t.Errorf("任务统计数量不一致: 分项合计 %d, 总数 %d", sum, stats["total"])
 	}
 }
