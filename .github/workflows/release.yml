@@ -1,0 +1,236 @@
+name: Release
+
+# 触发方式：
+#   1) push 形如 v1.0.0 的 tag
+#   2) 手动运行（可只填版本号）
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+    inputs:
+      version:
+        description: '版本号（不含 v；留空则使用 0.0.<run_number>）'
+        required: false
+        type: string
+
+permissions:
+  contents: write
+
+jobs:
+  # ==========================================================================
+  # 解析版本号
+  # ==========================================================================
+  prepare:
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.ver.outputs.version }}
+      tag: ${{ steps.ver.outputs.tag }}
+      prerelease: ${{ steps.ver.outputs.prerelease }}
+    steps:
+      - name: Resolve version
+        id: ver
+        shell: bash
+        run: |
+          set -euo pipefail
+          input_version='${{ inputs.version }}'
+          if [[ "${GITHUB_EVENT_NAME}" == "workflow_dispatch" && -n "${input_version}" ]]; then
+            version="${input_version#v}"
+            tag="v${version}"
+          elif [[ "${GITHUB_REF_TYPE}" == "tag" ]]; then
+            tag="${GITHUB_REF_NAME}"
+            version="${tag#v}"
+          else
+            version="0.0.${GITHUB_RUN_NUMBER}"
+            tag="v${version}"
+          fi
+          prerelease=false
+          if [[ "${tag}" == *alpha* || "${tag}" == *beta* ]]; then
+            prerelease=true
+          fi
+          echo "version=${version}" >> "$GITHUB_OUTPUT"
+          echo "tag=${tag}" >> "$GITHUB_OUTPUT"
+          echo "prerelease=${prerelease}" >> "$GITHUB_OUTPUT"
+
+  # ==========================================================================
+  # Linux amd64 / arm64（CGO 依赖交叉工具链，产物含 static 目录）
+  # ==========================================================================
+  build-linux:
+    needs: prepare
+    runs-on: ubuntu-22.04
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: amd64
+            cc: gcc
+            apt: gcc
+          - arch: arm64
+            cc: aarch64-linux-gnu-gcc
+            apt: gcc-aarch64-linux-gnu
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: Install toolchain
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y ${{ matrix.apt }}
+
+      - name: Build
+        env:
+          CGO_ENABLED: '1'
+          GOOS: linux
+          GOARCH: ${{ matrix.arch }}
+          CC: ${{ matrix.cc }}
+        run: |
+          mkdir -p dist
+          go build -trimpath -ldflags "-s -w" -v -o dist/hostagent ./cmd/server
+
+      - name: Package tar.gz
+        run: |
+          mkdir -p pkg
+          cp dist/hostagent pkg/
+          cp -R static pkg/
+          tar -C pkg -czf "dist/hostagent-linux-${{ matrix.arch }}.tar.gz" hostagent static
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: hostagent-linux-${{ matrix.arch }}
+          path: dist/hostagent-linux-${{ matrix.arch }}.tar.gz
+          if-no-files-found: error
+
+  # ==========================================================================
+  # Windows amd64：MinGW 编译 + Inno Setup 打包（NSSM 注册系统服务）
+  # ==========================================================================
+  build-windows:
+    needs: prepare
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: Install MinGW and Inno Setup
+        shell: pwsh
+        run: |
+          choco install mingw innosetup -y --no-progress
+          "C:\ProgramData\chocolatey\bin" | Out-File -Append -Encoding utf8 $env:GITHUB_PATH
+          gcc --version
+
+      - name: Build
+        shell: pwsh
+        env:
+          CGO_ENABLED: '1'
+          GOOS: windows
+          GOARCH: amd64
+        run: |
+          New-Item -ItemType Directory -Force dist | Out-Null
+          go build -trimpath -ldflags "-s -w" -v -o dist/hostagent.exe ./cmd/server
+
+      - name: Fetch NSSM
+        shell: pwsh
+        run: |
+          Invoke-WebRequest -Uri "https://nssm.cc/release/nssm-2.24.zip" -OutFile nssm.zip
+          Expand-Archive nssm.zip -DestinationPath nssm -Force
+          Copy-Item "nssm\nssm-2.24\win64\nssm.exe" "packaging\windows\nssm.exe" -Force
+
+      - name: Build Inno Setup installer
+        shell: pwsh
+        run: |
+          $iscc = "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe"
+          & $iscc "/DAppVersion=${{ needs.prepare.outputs.version }}" "packaging\windows\hostagent.iss"
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+      - name: Package portable zip
+        shell: pwsh
+        run: |
+          Compress-Archive -Path dist\hostagent.exe, static -DestinationPath "dist\hostagent-windows-amd64.zip" -Force
+          Copy-Item "BuildCache\windows\*.exe" dist\ -Force
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: hostagent-windows-amd64
+          path: |
+            dist/hostagent-windows-amd64.zip
+            dist/*-setup.exe
+          if-no-files-found: error
+
+  # ==========================================================================
+  # macOS（暂时不启用，需要时取消注释）
+  #
+  # 说明：mattn/go-sqlite3 需要 CGO，macos runner 自带 clang，可直接编译。
+  # 产物为 .pkg（安装到 /usr/local/openidcs + launchd 服务）。
+  # ==========================================================================
+  # build-macos:
+  #   needs: prepare
+  #   runs-on: macos-latest
+  #   strategy:
+  #     fail-fast: false
+  #     matrix:
+  #       include:
+  #         - arch: arm64
+  #         - arch: amd64
+  #   steps:
+  #     - uses: actions/checkout@v4
+  #
+  #     - uses: actions/setup-go@v5
+  #       with:
+  #         go-version-file: go.mod
+  #         cache: true
+  #
+  #     - name: Build
+  #       env:
+  #         CGO_ENABLED: '1'
+  #         GOOS: darwin
+  #         GOARCH: ${{ matrix.arch }}
+  #       run: |
+  #         mkdir -p dist
+  #         go build -trimpath -ldflags "-s -w" -v -o "dist/hostagent-darwin-${{ matrix.arch }}" ./cmd/server
+  #
+  #     - name: Build pkg
+  #       run: |
+  #         chmod +x packaging/macos/build-pkg.sh
+  #         ./packaging/macos/build-pkg.sh "${{ needs.prepare.outputs.version }}" "${{ matrix.arch }}"
+  #
+  #     - uses: actions/upload-artifact@v4
+  #       with:
+  #         name: hostagent-macos-${{ matrix.arch }}
+  #         path: BuildCache/*.pkg
+  #         if-no-files-found: error
+
+  # ==========================================================================
+  # 创建 Release
+  # ==========================================================================
+  release:
+    needs: [prepare, build-linux, build-windows]
+    if: github.event_name == 'workflow_dispatch' || startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: List artifacts
+        run: ls -lh dist
+
+      - uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ needs.prepare.outputs.tag }}
+          name: ${{ needs.prepare.outputs.tag }}
+          prerelease: ${{ needs.prepare.outputs.prerelease == 'true' }}
+          generate_release_notes: true
+          files: |
+            dist/*.tar.gz
+            dist/*.zip
+            dist/*-setup.exe
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

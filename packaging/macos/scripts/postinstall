@@ -1,0 +1,19 @@
+#!/bin/bash
+# 安装后创建数据/日志目录并加载 launchd 服务
+set -u
+
+PLIST="/Library/LaunchDaemons/com.openidcst.hostagent.plist"
+DATA_DIR="/usr/local/var/lib/openidcs"
+LOG_DIR="/usr/local/var/log/openidcs"
+
+mkdir -p "$DATA_DIR" "$LOG_DIR"
+chmod 750 "$DATA_DIR"
+chown -R root:wheel /usr/local/openidcs "$DATA_DIR" "$LOG_DIR" 2>/dev/null || true
+chown root:wheel "$PLIST" 2>/dev/null || true
+chmod 644 "$PLIST" 2>/dev/null || true
+chmod 755 /usr/local/openidcs/hostagent 2>/dev/null || true
+
+launchctl bootout system "$PLIST" >/dev/null 2>&1 || true
+launchctl bootstrap system "$PLIST" >/dev/null 2>&1 || launchctl load -w "$PLIST" >/dev/null 2>&1 || true
+
+exit 0

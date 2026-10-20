@@ -91,38 +91,69 @@ OpenIDC-Client是一个开源的IDC（Internet Data Center）虚拟化统一管�
 
 ## 🚀 快速开始
 
+项目提供三种开箱即用的部署方式，均从 [Releases](https://github.com/OpenIDCSTeam/IDCClient/releases) 获取预编译二进制，目标机无需 Go / Python 环境。
+
 ### Linux 一键安装（推荐）
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/OpenIDCSTeam/HostAgent/main/install.sh | sudo bash
+curl -fsSL https://raw.githubusercontent.com/OpenIDCSTeam/IDCClient/main/install.sh | sudo bash
 ```
 
-安装完成后使用 `openidcs` 命令管理服务：
+脚本会按 CPU 架构下载对应的 Release 二进制，安装程序到 `/opt/openidcs`、数据到
+`/var/lib/openidcs`，并注册 systemd 服务 `openidcs`（默认端口 `1881`，开机自启）：
 
 ```bash
-sudo openidcs start        # 启动服务
-sudo openidcs stop         # 停止服务
-sudo openidcs restart      # 重启服务
-sudo openidcs status       # 查看运行状态
-sudo openidcs update       # 更新到最新版本
-sudo openidcs uninstall    # 卸载程序
-sudo openidcs log          # 查看实时日志
-sudo openidcs service enable   # 设置开机自启
+sudo systemctl status openidcs     # 查看状态
+sudo journalctl -u openidcs -f     # 查看实时日志
+sudo bash install.sh --uninstall   # 卸载（保留数据）
 ```
 
-> 如需源码安装（开发用途），请使用：
-> ```bash
-> curl -fsSL https://raw.githubusercontent.com/OpenIDCSTeam/HostAgent/main/install.sh | sudo bash -s -- --source
-> ```
+常用参数：
 
-### Windows 下载运行
+| 参数 | 说明 |
+|------|------|
+| `--version v1.0.0` | 指定 Release 版本，默认 `latest`（也支持 `alpha` / `beta`） |
+| `--port 1881` | HTTP 端口 |
+| `--dir /opt/openidcs` | 程序安装目录 |
+| `--data-dir /var/lib/openidcs` | 数据目录 |
+| `--file ./hostagent-linux-amd64.tar.gz` | 离线包安装 |
+| `--firewall` | 自动放行 1881 / 6080 / 7681 |
+| `--uninstall [--purge]` | 卸载，`--purge` 同时删除数据 |
 
-1. **下载构建二进制**：[Releases · OpenIDCSTeam/HostAgent](https://github.com/OpenIDCSTeam/HostAgent/releases)
-2. **运行二进制**：`OpenIDCS-Client`
+### Windows 安装（Inno Setup）
+
+1. 从 [Releases](https://github.com/OpenIDCSTeam/IDCClient/releases) 下载
+   `OpenIDCS-HostAgent-<版本>-win-x64-setup.exe`。
+2. 双击安装，安装器会通过 NSSM 注册系统服务 `OpenIDCS-HostAgent`（LocalSystem，
+   开机自启，异常自动重启），并可选放行 1881 / 6080 / 7681 端口。
+
+| 项目 | 路径 |
+|------|------|
+| 程序目录 | `C:\Program Files\OpenIDCS\HostAgent` |
+| 数据目录 | `C:\ProgramData\OpenIDCS\HostAgent\DataSaving`（升级不丢失） |
+| 服务名 | `OpenIDCS-HostAgent` |
+
+也可以下载 `hostagent-windows-amd64.zip` 免安装运行。
+
+### macOS 安装（pkg）
+
+```bash
+# 构建 pkg（需 macOS + Xcode Command Line Tools）
+GOOS=darwin GOARCH=arm64 CGO_ENABLED=1 \
+  go build -trimpath -ldflags "-s -w" -o dist/hostagent-darwin-arm64 ./cmd/server
+chmod +x packaging/macos/build-pkg.sh
+./packaging/macos/build-pkg.sh 1.0.0 arm64
+
+sudo installer -pkg BuildCache/OpenIDCS-HostAgent-1.0.0-macos-arm64.pkg -target /
+```
+
+安装到 `/usr/local/openidcs`，由 launchd 服务 `com.openidcst.hostagent` 托管，
+数据目录 `/usr/local/var/lib/openidcs`。CI 中的 macOS 任务默认注释，需要时在
+`.github/workflows/release.yml` 取消 `build-macos` 注释。
 
 ### 访问后端
 
-1. **登录系统**: 打开浏览器访问: http://localhost:1880
+1. **登录系统**: 打开浏览器访问: http://localhost:1881
 2. **添加主机**: 进入"主机管理"添加VMware Workstation等主机
 3. **配置网络**: 设置IP地址池和NAT规则
 4. **创建用户**: 为团队成员创建账户并分配权限
@@ -140,56 +171,48 @@ sudo openidcs service enable   # 设置开机自启
 
 ### 环境要求
 
-- **操作系统**: Windows 10/11, Linux (Ubuntu 18.04+, CentOS 7+), macOS 10.14+
-- **Python**: 3.8 或更高版本
+- **操作系统**: Windows 10/11、Linux（Ubuntu 20.04+ / Debian 11+ / RHEL 8+）、macOS 12+
+- **Go**: 1.26 或更高版本
+- **C 工具链**: SQLite 驱动依赖 CGO（Linux `gcc`、Windows MinGW、macOS `clang`）
 - **内存**: 最少 4GB RAM（推荐 8GB+）
-- **存储**: 最少 2GB 可用空间
 - **网络**: 能够访问虚拟化平台的管理接口
 
 ### 开发部署
 
 #### 克隆项目
 ```bash
-git clone https://github.com/OpenIDCSTeam/HostAgent.git
-cd HostAgent
-
+git clone https://github.com/OpenIDCSTeam/IDCClient.git
+cd IDCClient
 ```
 
-#### 创建环境
+#### 编译
 ```bash
-python -m venv venv
-source venv/bin/activate  # Linux/Mac
-venv\Scripts\activate     # Windows
+go mod download
+go build -o hostagent ./cmd/server      # Windows: -o hostagent.exe
 ```
 
-#### 安装依赖
-```bash
-pip install -r HostConfig/pipinstall.txt
-```
+> 交叉编译时需同时指定 `GOOS` / `GOARCH` / `CC`，例如
+> `GOOS=linux GOARCH=arm64 CC=aarch64-linux-gnu-gcc CGO_ENABLED=1 go build -o hostagent ./cmd/server`。
 
 #### 启动后端
 ```bash
-python HostServer.py
+./hostagent --port 1881 --data-dir ./DataSaving
 ```
 
-#### 前端开发
+前端资源已随仓库 `static/` 目录提供，程序按工作目录读取 `./static`，启动时请保持目录一致。
 
-```bash
-cd FrontPages
-npm install
-npm run dev
-
-# 前端生产构建
-npm run build
-```
-
-### 构建分发
+### 构建与发布
 
 | 方式 | 命令 |
 |------|------|
-| Nuitka（推荐，Windows） | `cd AllBuilder && build_nuitka.bat` |
-| Nuitka（Linux/Mac） | `cd AllBuilder && ./build_nuitkaui.sh` |
-| cx_Freeze | `python HostBuilds.py build` |
+| 本地 Linux/macOS | `./build.sh [linux\|windows\|darwin]` |
+| 本地 Windows | `build.bat [linux\|windows\|darwin]` |
+| CI 发布 | 推送 `v*` tag，或手动运行 `Release` 工作流 |
+| Windows 安装包 | `packaging/windows/hostagent.iss`（Inno Setup 6 + NSSM） |
+| macOS pkg | `packaging/macos/build-pkg.sh` |
+
+> `mattn/go-sqlite3` 依赖 CGO，交叉编译需要目标平台的 C 工具链；CI 中 Linux arm64 使用
+> `aarch64-linux-gnu-gcc`，Windows 使用 MinGW。
 
 欢迎通过 Issue、Pull Request、文档完善或测试反馈等方式参与贡献。
 

@@ -10,6 +10,10 @@ DataSaving/
 # Go工具链
 vendor/
 
+# 构建/打包产物
+/BuildCache/
+/dist/
+
 # IDE
 .idea/
 .vscode/
