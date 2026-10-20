@@ -1,0 +1,4 @@
+# 部署脚本必须保持 LF，否则在 Linux / macOS 上执行会报 interpreter 错误
+*.sh text eol=lf
+packaging/macos/scripts/preinstall text eol=lf
+packaging/macos/scripts/postinstall text eol=lf
