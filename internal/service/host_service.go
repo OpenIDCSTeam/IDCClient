@@ -482,7 +482,7 @@ func rowToHSConfig(row *data.HSConfigRow) (*model.HSConfig, error) {
 	if row.IPAddrMaps != "" && row.IPAddrMaps != "{}" {
 		_ = json.Unmarshal([]byte(row.IPAddrMaps), &cfg.IPAddrMaps)
 	}
-	if row.IPAddrDDNS != "" && row.IPAddrDDNS != "[]" {
+	if row.IPAddrDDNS != "" && row.IPAddrDDNS != "null" {
 		_ = json.Unmarshal([]byte(row.IPAddrDDNS), &cfg.IPAddrDDNS)
 	}
 	if row.ServerPlan != "" && row.ServerPlan != "{}" {

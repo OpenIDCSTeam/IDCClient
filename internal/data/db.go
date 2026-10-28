@@ -604,7 +604,15 @@ func (d *DB) GetHost(hsName string) (*HSConfigRow, error) {
 
 // CreateHost 创建主机配置
 func (d *DB) CreateHost(row *HSConfigRow) error {
-	_, err := d.db.Exec(`INSERT INTO hs_config (hs_name, server_name, server_type, server_addr,
+	return createHostRow(d.db, row)
+}
+
+type hostConfigExecutor interface {
+	Exec(query string, args ...interface{}) (sql.Result, error)
+}
+
+func createHostRow(executor hostConfigExecutor, row *HSConfigRow) error {
+	_, err := executor.Exec(`INSERT INTO hs_config (hs_name, server_name, server_type, server_addr,
 		server_user, server_pass, server_port, images_path, dvdrom_path, system_path,
 		backup_path, extern_path, launch_path, network_nat, network_pub, filter_name,
 		i_kuai_addr, i_kuai_user, i_kuai_pass, ports_start, ports_close, remote_port,
@@ -628,7 +636,11 @@ func (d *DB) CreateHost(row *HSConfigRow) error {
 
 // UpdateHost 更新主机配置
 func (d *DB) UpdateHost(row *HSConfigRow) error {
-	_, err := d.db.Exec(`UPDATE hs_config SET server_name=?, server_type=?, server_addr=?,
+	return updateHostRow(d.db, row)
+}
+
+func updateHostRow(executor hostConfigExecutor, row *HSConfigRow) error {
+	_, err := executor.Exec(`UPDATE hs_config SET server_name=?, server_type=?, server_addr=?,
 		server_user=?, server_pass=?, server_port=?, images_path=?, dvdrom_path=?, system_path=?,
 		backup_path=?, extern_path=?, launch_path=?, network_nat=?, network_pub=?, filter_name=?,
 		i_kuai_addr=?, i_kuai_user=?, i_kuai_pass=?, ports_start=?, ports_close=?, remote_port=?,

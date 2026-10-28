@@ -282,6 +282,8 @@ func (app *App) registerRoutes() {
 		// 主机管理
 		api.GET("/server/detail", app.handleHostList)
 		api.GET("/server/detail/:hs_name", adminMW, app.handleHostDetail)
+		api.GET("/server/config/export", adminMW, app.handleHostConfigExport)
+		api.POST("/server/config/restore", adminMW, app.handleHostConfigRestore)
 		api.POST("/server/create", adminMW, app.handleHostCreate)
 		api.PUT("/server/update/:hs_name", adminMW, app.handleHostUpdate)
 		api.DELETE("/server/delete/:hs_name", adminMW, app.handleHostDelete)
